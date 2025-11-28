@@ -183,7 +183,7 @@ def extract_metadata(post):
 # TELEGRAM ЛОГИКА
 
 async def process_and_send(bot, session, pool):
-    logger.info("Starting processing cycle...")
+    logger.info("Starting processing cycle")
     
     # 1. Скачиваем список постов
     posts = await fetch_e621_posts(session)
@@ -192,7 +192,7 @@ async def process_and_send(bot, session, pool):
     new_posts = await filter_existing_posts(pool, posts)
     
     if not new_posts:
-        logger.warning("No new posts found.")
+        logger.warning("No new posts found")
         return
 
     sent_count = 0
