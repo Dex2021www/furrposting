@@ -1,0 +1,9 @@
+aiogram>=3.0.0
+aiohttp[speedups]
+aiodns
+faust-cchardet
+uvloop
+asyncpg
+ujson
+cachetools
+loguru
