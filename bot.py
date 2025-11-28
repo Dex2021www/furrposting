@@ -16,10 +16,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
 
-# ---------------- КОНФИГУРАЦИЯ ---------------- #
+# КОНФИГУРАЦИЯ
 
-# Читаем переменные окружения.
-# Если переменной нет, бот упадет с ошибкой (что хорошо, так мы сразу поймем проблему)
+# Читаем переменные окружения
+# Если переменной нет, бот упадет с ошибкой
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is not set!")
@@ -40,7 +40,7 @@ BLACKLIST_WORDS = {"scat", "guro", "loli", "blood", "lolikon", "shota", "cub", "
 BLACKLIST_SET = set(BLACKLIST_WORDS)
 VIDEOS_PER_HOUR = 2
 
-# ---------------- ИНИЦИАЛИЗАЦИЯ ---------------- #
+# ИНИЦИАЛИЗАЦИЯ
 
 # Используем быстрый Event Loop
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -49,7 +49,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger.remove()
 logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
 
-# ---------------- БАЗА ДАННЫХ (NEON) ---------------- #
+# БАЗА ДАННЫХ (NEON)
 
 async def init_db(pool):
     """Создает таблицу для учета отправленных видео."""
@@ -95,7 +95,7 @@ async def mark_as_posted(pool, e621_id):
             e621_id
         )
 
-# ---------------- E621 ЛОГИКА ---------------- #
+# E621 ЛОГИКА
 
 def get_dynamic_tags():
     """
@@ -180,7 +180,7 @@ def extract_metadata(post):
         "caption": f"<b>Artist:</b> {artist_str}\n<b>Source:</b> <a href='{source_link}'>e621</a>"
     }
 
-# ---------------- TELEGRAM ЛОГИКА ---------------- #
+# TELEGRAM ЛОГИКА
 
 async def process_and_send(bot, session, pool):
     logger.info("Starting processing cycle...")
@@ -214,7 +214,7 @@ async def process_and_send(bot, session, pool):
             is_gif = meta["ext"] == "gif"
             send_method = bot.send_animation if is_gif else bot.send_video
             
-            # --- ВАРИАНТ 1: Отправка по URL (< 20 MB) ---
+            # ВАРИАНТ 1: Отправка по URL (< 20 MB)
             if file_size_mb < 20:
                 logger.info(f"Sending URL [{meta['ext']}]: {meta['id']} ({file_size_mb:.2f} MB)")
                 
@@ -227,7 +227,7 @@ async def process_and_send(bot, session, pool):
                     parse_mode=ParseMode.HTML
                 )
                 
-            # --- ВАРИАНТ 2: Скачивание в RAM (20-50 MB) ---
+            # ВАРИАНТ 2: Скачивание в RAM (20-50 MB)
             elif file_size_mb < 50:
                 logger.info(f"RAM Upload [{meta['ext']}]: {meta['id']} ({file_size_mb:.2f} MB)")
                 
@@ -269,7 +269,7 @@ async def process_and_send(bot, session, pool):
 
     logger.info(f"Cycle finished. Sent {sent_count}/{VIDEOS_PER_HOUR}.")
 
-# ---------------- SERVER & SCHEDULER ---------------- #
+# SERVER & SCHEDULER
 
 async def health_check(request):
     """Простой эндпоинт для пинга."""
@@ -297,7 +297,7 @@ async def start_web_server():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"🌍 Web server running on port {port}")
+    logger.info(f"Web server running on port {port}")
 
 async def main():
     # Создаем пул соединений к БД (минимальный размер для экономии RAM)
@@ -320,4 +320,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped.")
+        logger.info("Bot stopped")
