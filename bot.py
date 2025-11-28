@@ -22,7 +22,7 @@ from loguru import logger
 # Если переменной нет, бот упадет с ошибкой
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is not set!")
+    logger.error("BOT_TOKEN is not set")
     sys.exit(1)
 
 CHANNEL_ID = os.getenv("CHANNEL_ID")
@@ -34,7 +34,7 @@ E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/1.0 (by Dexz)")
 
 # Настройки поиска
 BASE_TAGS = "rating:q,e order:score -human" 
-MIN_SCORE = 130
+MIN_SCORE = 120
 ALLOWED_EXTS = {"webm", "mp4", "gif"}
 BLACKLIST_WORDS = {"scat", "guro", "loli", "blood", "lolikon", "shota", "cub", "gore", "poop", "shit", "vore"} 
 BLACKLIST_SET = set(BLACKLIST_WORDS)
