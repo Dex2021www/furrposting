@@ -28,22 +28,17 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")
 DB_DSN = os.getenv("DB_DSN")
 
 # e621 Settings
-# ВАЖНО: User-Agent должен быть уникальным.
 E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/2.0 (by Dexz)")
 
-# Базовый запрос:
-# -rating:safe  -> Исключить безопасный контент (остается Q и E)
-# order:random  -> Случайный порядок (чтобы не застревать на топах)
-# -human        -> Без людей
+# Базовый запрос
 BASE_TAGS = "-rating:safe order:random -human"
-MIN_SCORE = 130  # Высокое качество
+MIN_SCORE = 130
 
 # Настройки планировщика
 VIDEOS_PER_BATCH = 2
-# Если переменная SLEEP_INTERVAL не задана, спим 3600 сек (1 час)
 SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", 3600))
 
-# Блеклист (Множество для скорости O(1))
+# Блеклист
 BLACKLIST_WORDS = {"scat", "guro", "bestiality", "cub", "gore", "watersports"}
 BLACKLIST_SET = set(BLACKLIST_WORDS)
 
@@ -54,16 +49,14 @@ ALLOWED_EXTS = {"webm", "mp4", "gif"}
 logger.remove()
 logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
 
-# Проверка обязательных переменных
 if not BOT_TOKEN or not CHANNEL_ID or not DB_DSN:
-    logger.critical("❌ Переменные окружения (BOT_TOKEN, CHANNEL_ID, DB_DSN) не заданы!")
+    logger.critical("❌ Переменные окружения не заданы!")
     sys.exit(1)
 
 
 # ---------------- [ БАЗА ДАННЫХ ] ---------------- #
 
 async def init_db(pool):
-    """Инициализация таблицы."""
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS posted_videos (
@@ -75,217 +68,138 @@ async def init_db(pool):
         """)
 
 async def filter_new_posts(pool, posts_data):
-    """
-    Фильтрация дубликатов. 
-    Отправляем список ID в базу, получаем те, что уже есть, и вычитаем их.
-    Экономит CPU и сеть (1 запрос вместо N).
-    """
     if not posts_data:
         return []
-    
-    # Собираем ID из пришедших данных
     candidate_ids = [p['id'] for p in posts_data]
-    
     async with pool.acquire() as conn:
-        # ANY($1::int[]) - очень быстрая проверка вхождения в массив в Postgres
-        rows = await conn.fetch(
-            "SELECT e621_id FROM posted_videos WHERE e621_id = ANY($1::int[])",
-            candidate_ids
-        )
-    
+        rows = await conn.fetch("SELECT e621_id FROM posted_videos WHERE e621_id = ANY($1::int[])", candidate_ids)
     existing_ids = {r['e621_id'] for r in rows}
-    
-    # Возвращаем только те посты, ID которых НЕТ в базе
     new_posts = [p for p in posts_data if p['id'] not in existing_ids]
     logger.info(f"🔍 DB Filter: {len(posts_data)} fetched -> {len(new_posts)} new.")
     return new_posts
 
 async def mark_as_posted(pool, e621_id):
-    """Добавляем ID в базу (игнорируя, если вдруг уже есть)."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO posted_videos (e621_id) VALUES ($1) ON CONFLICT DO NOTHING", 
-            e621_id
-        )
+        await conn.execute("INSERT INTO posted_videos (e621_id) VALUES ($1) ON CONFLICT DO NOTHING", e621_id)
 
 
 # ---------------- [ E621 API ] ---------------- #
 
 def get_query_tags():
-    """
-    Формирует строку запроса.
-    ОПТИМИЗАЦИЯ: Вместо скобок (A ~ B) используем исключение (-C -D).
-    Это намного стабильнее работает в API.
-    """
-    # Исключаем статику (jpg, png) и флеш (swf). 
-    # Остаются только gif и webm (видео).
-    # order:random меняем посты при каждом запросе.
     tags = f"{BASE_TAGS} -type:png -type:jpg -type:swf"
-    
     roll = random.random()
-    
-    # Логика: date:<Time означает "Младше чем Time"
     if roll < 0.15:
-        # 15% шанс: Свежее (младше 6 месяцев)
         tags += " date:<6months"
         mode = "Fresh (<6mo)"
     elif roll < 0.35:
-        # 20% шанс: Современное (младше 1 года)
         tags += " date:<1year"
         mode = "Modern (<1yr)"
     else:
-        # 65% шанс: Любое время
         mode = "Legacy (Any)"
-        
-    logger.info(f"🎲 Mode: {mode} | Query: {tags} | Score: >={MIN_SCORE}")
+    logger.info(f"🎲 Mode: {mode} | Query: {tags}")
     return tags
 
 async def fetch_posts(session):
-    """Запрос к API e621."""
     url = "https://e621.net/posts.json"
-    
-    params = {
-        "tags": f"{get_query_tags()} score:>={MIN_SCORE}",
-        "limit": 50  # Берем с запасом, чтобы после фильтрации БД что-то осталось
-    }
+    params = {"tags": f"{get_query_tags()} score:>={MIN_SCORE}", "limit": 50}
     headers = {"User-Agent": E621_USER_AGENT}
-    
     try:
         async with session.get(url, params=params, headers=headers) as response:
             if response.status != 200:
                 logger.error(f"❌ API Error: {response.status}")
                 return []
-            
-            # ujson быстрее стандартного json
             data = await response.json(loads=ujson.loads)
-            posts = data.get("posts", [])
-            
-            if not posts:
-                logger.warning("⚠️ API returned 0 posts. Check tags/score.")
-                
-            return posts
+            return data.get("posts", [])
     except Exception as e:
         logger.error(f"❌ Fetch Error: {e}")
         return []
 
 def parse_post(post):
-    """Извлекает и валидирует данные поста."""
     f = post.get("file")
-    if not f or not f.get("url"):
-        return None
-    
+    if not f or not f.get("url"): return None
     ext = f["ext"]
-    if ext not in ALLOWED_EXTS:
-        return None
+    if ext not in ALLOWED_EXTS: return None
     
-    # 1. Проверка Блеклиста (Set optimized)
     ptags = post["tags"]
-    # Объединяем все категории тегов
-    all_tags_list = (ptags["general"] + ptags["character"] + 
-                     ptags["species"] + ptags["copyright"])
-    
-    # Преобразуем в set для быстрой проверки пересечения
-    post_tags_set = set(all_tags_list)
-    
-    # isdisjoint = True, если нет общих элементов. 
-    # Если False (есть общие) -> сработал блеклист.
-    if not post_tags_set.isdisjoint(BLACKLIST_SET):
-        return None
+    all_tags = set(ptags["general"] + ptags["character"] + ptags["species"] + ptags["copyright"])
+    if not all_tags.isdisjoint(BLACKLIST_SET): return None
 
-    # 2. Форматирование текста
     artists = ptags["artist"]
-    # Генератор списка + f-string (быстро)
-    artist_links = [
-        f'<a href="https://e621.net/posts?tags={a}">{a.replace("_", " ").title()}</a>' 
-        for a in artists
-    ]
-    artist_str = ", ".join(artist_links) if artist_links else "Unknown"
-    source_link = f"https://e621.net/posts/{post['id']}"
+    artist_links = [f'<a href="https://e621.net/posts?tags={a}">{a.replace("_", " ").title()}</a>' for a in artists]
+    caption = f"<b>Artist:</b> {', '.join(artist_links) if artist_links else 'Unknown'}\n<b>Source:</b> <a href='https://e621.net/posts/{post['id']}'>e621</a>"
     
-    caption = f"<b>Artist:</b> {artist_str}\n<b>Source:</b> <a href='{source_link}'>e621</a>"
-    
-    return {
-        "id": post["id"],
-        "url": f["url"],
-        "size": f["size"],
-        "ext": ext,
-        "caption": caption
-    }
+    return {"id": post["id"], "url": f["url"], "size": f["size"], "ext": ext, "caption": caption}
 
 
-# ---------------- [ БОТ & ОТПРАВКА ] ---------------- #
+# ---------------- [ ОТПРАВКА (FIXED) ] ---------------- #
 
 async def send_media(bot, session, meta):
-    """Умная отправка: URL или RAM Upload."""
-    
-    # Константа байт в МБ
+    """
+    Отправляет медиа. 
+    ИСПРАВЛЕНО: Строгое разделение send_video и send_animation.
+    """
     size_mb = meta["size"] / 1_048_576 
-    
-    # Определяем метод (GIF -> Animation, Video -> Video)
     is_gif = meta["ext"] == "gif"
-    send_func = bot.send_animation if is_gif else bot.send_video
     
     try:
-        # --- СЦЕНАРИЙ 1: Легкий файл (< 20 МБ) ---
-        # Отправляем прямую ссылку. Сервер Telegram сам скачает.
-        # RAM usage: ~0 MB.
+        # 1. URL Sending (< 20 MB)
         if size_mb < 20:
             logger.info(f"📤 Sending via URL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-            file_input = URLInputFile(meta["url"])
+            media_file = URLInputFile(meta["url"])
             
-            await send_func(
-                chat_id=CHANNEL_ID,
-                animation=file_input if is_gif else None,
-                video=file_input if not is_gif else None,
-                caption=meta["caption"],
-                parse_mode=ParseMode.HTML
-            )
+            if is_gif:
+                await bot.send_animation(
+                    chat_id=CHANNEL_ID,
+                    animation=media_file,
+                    caption=meta["caption"],
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=media_file,
+                    caption=meta["caption"],
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True
+                )
             return True
 
-        # --- СЦЕНАРИЙ 2: Средний файл (20-50 МБ) ---
-        # Лимит URL upload - 20MB. Лимит Bot API upload - 50MB.
-        # Качаем в RAM, отправляем, чистим.
+        # 2. RAM Upload (20-50 MB)
         elif size_mb < 50:
             logger.info(f"⬇️ RAM Download [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-            
             async with session.get(meta["url"]) as resp:
-                if resp.status != 200:
-                    logger.error(f"Download failed: {resp.status}")
-                    return False
-                
-                # Читаем в память
+                if resp.status != 200: return False
                 content = await resp.read()
                 
-            # Оборачиваем в BytesIO
             file_obj = BytesIO(content)
             file_obj.name = f"{meta['id']}.{meta['ext']}"
+            del content # Free RAM
             
-            # ВАЖНО: Удаляем исходную переменную content, чтобы освободить память 
-            # еще до начала отправки (BytesIO уже держит копию данных)
-            del content
-            
-            # Отправляем
             file_input = BufferedInputFile(file_obj.getvalue(), filename=file_obj.name)
             logger.info(f"⬆️ RAM Uploading...")
             
-            await send_func(
-                chat_id=CHANNEL_ID,
-                animation=file_input if is_gif else None,
-                video=file_input if not is_gif else None,
-                caption=meta["caption"],
-                parse_mode=ParseMode.HTML,
-                supports_streaming=not is_gif
-            )
+            if is_gif:
+                await bot.send_animation(
+                    chat_id=CHANNEL_ID,
+                    animation=file_input,
+                    caption=meta["caption"],
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await bot.send_video(
+                    chat_id=CHANNEL_ID,
+                    video=file_input,
+                    caption=meta["caption"],
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True
+                )
             
-            # ЯВНАЯ ОЧИСТКА ПАМЯТИ
             file_obj.close()
             del file_obj
             del file_input
-            gc.collect() # Принудительный вызов сборщика мусора
-            
+            gc.collect()
             return True
             
-        # --- СЦЕНАРИЙ 3: Тяжелый файл (> 50 МБ) ---
         else:
             logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
             return False
@@ -296,13 +210,8 @@ async def send_media(bot, session, meta):
 
 
 async def processing_cycle(bot, session, pool):
-    """Один цикл работы бота."""
     logger.info("--- 🔄 Cycle Start ---")
-    
-    # 1. Получение
     posts = await fetch_posts(session)
-    
-    # 2. Фильтрация БД
     new_posts = await filter_new_posts(pool, posts)
     
     if not new_posts:
@@ -310,78 +219,48 @@ async def processing_cycle(bot, session, pool):
         return
 
     sent_count = 0
-    
-    # 3. Обработка списка
     for post in new_posts:
-        if sent_count >= VIDEOS_PER_BATCH:
-            break
-            
-        meta = parse_post(post)
-        if not meta:
-            continue
-            
-        # Попытка отправки
-        success = await send_media(bot, session, meta)
+        if sent_count >= VIDEOS_PER_BATCH: break
         
-        if success:
-            # Если отправили - пишем в базу
+        meta = parse_post(post)
+        if not meta: continue
+        
+        if await send_media(bot, session, meta):
             await mark_as_posted(pool, meta["id"])
             sent_count += 1
-            # Пауза между сообщениями (Anti-flood)
             await asyncio.sleep(5)
     
     logger.info(f"--- ✅ Cycle End. Sent: {sent_count} ---")
 
 
-# ---------------- [ WEB & RUNNER ] ---------------- #
+# ---------------- [ RUNNER ] ---------------- #
 
-async def health_check(request):
-    """Пинг для Cloudflare Workers."""
-    return web.Response(text="Alive")
+async def health_check(request): return web.Response(text="Alive")
 
 async def start_web_server():
-    """Запуск aiohttp сервера."""
     app = web.Application()
     app.add_routes([web.get('/', health_check)])
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Порт от Render или 8080
     port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
+    await web.TCPSite(runner, '0.0.0.0', port).start()
     logger.info(f"🌍 Web server running on port {port}")
 
 async def scheduler(bot, session, pool):
-    """Бесконечный цикл."""
     while True:
         try:
             await processing_cycle(bot, session, pool)
         except Exception as e:
             logger.critical(f"🔥 Scheduler Crash: {e}")
-            
         logger.info(f"⏳ Sleeping for {SLEEP_INTERVAL} seconds...")
         await asyncio.sleep(SLEEP_INTERVAL)
 
 async def main():
-    # Настройка БД (ограничиваем пул до 2 соединений для экономии RAM)
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=2)
     await init_db(pool)
-    
-    # Настройка HTTP сессии (ujson + лимит соединений)
-    connector = TCPConnector(limit=10, ssl=False) 
-    # ssl=False немного разгружает CPU, если Render/CF берет SSL на себя, 
-    # но e621 требует https, поэтому aiohttp сам поднимет ssl для внешних запросов.
-    
-    async with ClientSession(connector=connector, json_serialize=ujson.dumps) as session:
-        
+    async with ClientSession(connector=TCPConnector(limit=10, ssl=False), json_serialize=ujson.dumps) as session:
         bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        
-        # Запускаем параллельно сервер и бота
-        await asyncio.gather(
-            start_web_server(),
-            scheduler(bot, session, pool)
-        )
+        await asyncio.gather(start_web_server(), scheduler(bot, session, pool))
 
 if __name__ == "__main__":
     try:
