@@ -33,7 +33,11 @@ DB_DSN = os.getenv("DB_DSN")
 E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/1.0 (by Dexz)")
 
 # Настройки поиска
-BASE_TAGS = "rating:q,e order:score -human" 
+# Было:
+# BASE_TAGS = "rating:q,e order:score -human"
+
+# Стало:
+BASE_TAGS = "rating:q,e order:random -human"
 MIN_SCORE = 120
 ALLOWED_EXTS = {"webm", "mp4", "gif"}
 BLACKLIST_WORDS = {"scat", "guro", "loli", "blood", "lolikon", "shota", "cub", "gore", "poop", "shit", "vore"} 
@@ -183,16 +187,24 @@ def extract_metadata(post):
 # TELEGRAM ЛОГИКА
 
 async def process_and_send(bot, session, pool):
-    logger.info("Starting processing cycle")
+    logger.info("Starting processing cycle...")
     
     # 1. Скачиваем список постов
     posts = await fetch_e621_posts(session)
     
+    # --- ДОБАВЛЕНА СТРОКА ДЛЯ ОТЛАДКИ ---
+    logger.info(f"🔎 API returned: {len(posts)} posts") 
+    # ------------------------------------
+
     # 2. Фильтруем дубликаты через БД
     new_posts = await filter_existing_posts(pool, posts)
     
+    # --- ДОБАВЛЕНА СТРОКА ДЛЯ ОТЛАДКИ ---
+    logger.info(f"🆕 After DB filter: {len(new_posts)} posts remain")
+    # ------------------------------------
+    
     if not new_posts:
-        logger.warning("No new posts found")
+        logger.warning("No new posts found.")
         return
 
     sent_count = 0
