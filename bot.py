@@ -7,6 +7,7 @@ import tempfile
 import glob
 import html
 import shutil
+import datetime
 from urllib.parse import urlparse
 
 # Сторонние библиотеки
@@ -16,7 +17,7 @@ import ujson
 import asyncpg
 from aiohttp import ClientSession, TCPConnector, ClientTimeout, web
 from aiogram import Bot
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
@@ -31,17 +32,27 @@ CONFIG = {
     "CHANNEL_ID": os.getenv("CHANNEL_ID"),
     "ADMIN_ID": os.getenv("ADMIN_ID"),
     "DB_DSN": os.getenv("DB_DSN"),
-    # Исправленный User-Agent с твоим ником
-    "USER_AGENT": os.getenv("E621_USER_AGENT", "TelegramVideoBot/14.0 (by Dexz)"),
-    "SLEEP_INTERVAL": int(os.getenv("SLEEP_INTERVAL", 3600)),
+    "USER_AGENT": os.getenv("E621_USER_AGENT", "TelegramVideoBot/16.0 (ByDexz)"),
     "VIDEOS_PER_BATCH": 2,
     "MIN_SCORE": 200,
     "MAX_DOWNLOAD_MB": 80.0, 
     "MAX_TG_MB": 49.9,
-    "CONVERT_TIMEOUT": 600
+    "CONVERT_TIMEOUT": 600,
+    "SLEEP_INTERVAL": int(os.getenv("SLEEP_INTERVAL", 3600))
 }
 
 BASE_TAGS = "-rating:safe order:random -human -type:png -type:jpg -type:swf"
+
+# Строгий блеклист по твоему запросу
+BLACKLIST_WORDS = {
+    "scat", "guro", "bestiality", "cub", "loli", "shota", 
+    "underage", "child", "young", "baby_furs", "gore", "watersports", 
+    "urine", "feces", "vomit", "diaper", "rape", "non-consensual", 
+    "nazi", "swastika", "ss_uniform", "third_reich", "fascist", 
+    "hate_symbol", "racism", "antisemitism", "confederate_flag", 
+    "furry_raiders", "political", "hyper"
+}
+BLACKLIST_SET = set(BLACKLIST_WORDS)
 
 IGNORED_ARTISTS = {
     "conditional_dnp", "sound_warning", "unknown", "anonymous",
@@ -150,7 +161,8 @@ class VideoConverter:
     async def process(input_path, output_path):
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
-        # Настройки баланса (720p, 30fps, crf 26)
+        # Настройки: 720p, 30fps, crf 26 (Баланс качества и веса)
+        # forced fps помогает избежать рассинхрона
         cmd = [
             "nice", "-n", "19", 
             ffmpeg_exe, "-y", "-v", "error",
@@ -169,7 +181,13 @@ class VideoConverter:
             )
             await asyncio.wait_for(process.wait(), timeout=CONFIG["CONVERT_TIMEOUT"])
             
-            if process.returncode == 0: return True
+            if process.returncode == 0:
+                # ПРОВЕРКА РЕЗУЛЬТАТА:
+                # Если выходной файл меньше 100Кб - это битая заглушка, а не видео.
+                if os.path.getsize(output_path) < 100 * 1024:
+                    logger.error("❌ Converted file is suspiciously small (Integrity Check Failed).")
+                    return False
+                return True
             else:
                 _, stderr = await process.communicate()
                 logger.error(f"FFmpeg Error: {stderr.decode()}")
@@ -240,9 +258,9 @@ class E621Client:
         ext = f["ext"]
         if ext not in {"webm", "mp4", "gif"}: return None
         
+        # Строгая проверка блеклиста (Set optimized)
         tags_flat = set(t for cat in post["tags"].values() for t in cat)
-        blacklist = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
-        if not tags_flat.isdisjoint(blacklist): return None
+        if not tags_flat.isdisjoint(BLACKLIST_SET): return None
 
         size_mb = f["size"] / 1_048_576
         target_url = f["url"]
@@ -258,37 +276,25 @@ class E621Client:
         preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
         artists = [a for a in post["tags"]["artist"] if a.lower() not in IGNORED_ARTISTS][:3]
         
-        # Генерация текста (без кнопок)
         artist_texts = []
         for name in artists:
             safe_name = html.escape(name.replace("_", " ").title())
             links = await self.get_artist_links(name)
-            
-            # Ссылка на e621 + (Ссылки в скобках)
             e621_link = f'<a href="https://e621.net/posts?tags={name}">{safe_name}</a>'
             
             if links:
-                # Формируем строку ссылок: Twitter | Patreon ...
                 external_links_str = " | ".join([f'<a href="{url}">{site}</a>' for site, url in links])
                 line = f"{e621_link} ({external_links_str})"
             else:
                 line = e621_link
-            
             artist_texts.append(line)
 
-        # Собираем красивый блок авторов
-        if not artist_texts:
-            artist_block = "<b>Artist:</b> Unknown"
-        elif len(artist_texts) == 1:
-            artist_block = f"<b>Artist:</b> {artist_texts[0]}"
-        else:
-            # Если несколько авторов - каждый с новой строки для читаемости
-            artist_block = "<b>Artists:</b>\n" + "\n".join(artist_texts)
+        if not artist_texts: artist_block = "<b>Artist:</b> Unknown"
+        elif len(artist_texts) == 1: artist_block = f"<b>Artist:</b> {artist_texts[0]}"
+        else: artist_block = "<b>Artists:</b>\n" + "\n".join(artist_texts)
 
         source_link = f"https://e621.net/posts/{post['id']}"
         qual_tag = " <i>(Compressed)</i>" if is_compressed else ""
-        
-        # Итоговое описание: Автор, Источник, Пометка сжатия
         caption = f"{artist_block}\n<b>Source:</b> <a href='{source_link}'>e621</a>{qual_tag}"
 
         return {
@@ -325,23 +331,35 @@ async def processing_cycle(bot, e621, db):
             thumb_file = os.path.join(temp_dir, f"thumb_{meta['id']}.jpg")
             final_file = input_file
             
-            # Download
+            # 1. Скачивание видео (С ПРОВЕРКОЙ РАЗМЕРА)
             dl_success = False
             for _ in range(3):
                 try:
                     async with e621.session.get(meta["url"], timeout=300) as resp:
                         if resp.status == 200:
+                            # Получаем ожидаемый размер
+                            expected_size = int(resp.headers.get('Content-Length', 0))
+                            
                             with open(input_file, 'wb') as f:
                                 while True:
                                     chunk = await resp.content.read(65536)
                                     if not chunk: break
                                     f.write(chunk)
+                            
+                            # ПРОВЕРКА ЦЕЛОСТНОСТИ ФАЙЛА
+                            actual_size = os.path.getsize(input_file)
+                            if expected_size > 0 and actual_size != expected_size:
+                                logger.warning(f"⚠️ Incomplete download: {actual_size}/{expected_size}. Retrying...")
+                                continue
+                                
                             dl_success = True; break
                 except: await asyncio.sleep(1)
             
-            if not dl_success: continue
+            if not dl_success: 
+                logger.error("❌ Failed to download file completely.")
+                continue
 
-            # Thumb
+            # 2. Скачивание превью
             has_thumb = False
             if meta["preview_url"] and meta["ext"] != "gif":
                 try:
@@ -351,7 +369,7 @@ async def processing_cycle(bot, e621, db):
                             has_thumb = True
                 except: pass
 
-            # Convert
+            # 3. Конвертация
             file_size = os.path.getsize(input_file) / 1_048_576
             needs_convert = (meta["ext"] == "webm") or (file_size > CONFIG["MAX_TG_MB"] and meta["ext"] == "mp4")
             
@@ -359,6 +377,7 @@ async def processing_cycle(bot, e621, db):
                 logger.info(f"⚙️ Converting ({meta['ext']} -> mp4)...")
                 output_mp4 = os.path.join(temp_dir, f"out_{meta['id']}.mp4")
                 
+                # Конвертация с проверкой результата
                 if await VideoConverter.process(input_file, output_mp4):
                     new_size = os.path.getsize(output_mp4) / 1_048_576
                     if new_size < CONFIG["MAX_TG_MB"]:
@@ -367,10 +386,14 @@ async def processing_cycle(bot, e621, db):
                     else: logger.warning("⚠️ Compressed result too big.")
                 else:
                     logger.warning("⚠️ Conversion failed.")
-                    if meta["ext"] == "webm" and file_size < CONFIG["MAX_TG_MB"]: pass 
-                    else: continue
+                    # Если конвертация провалилась (timeout или 0 байт),
+                    # мы отправляем оригинал ТОЛЬКО если это не WebM (он не сработал бы на айфоне)
+                    # и если он влезает в лимит.
+                    if meta["ext"] == "webm" or file_size > CONFIG["MAX_TG_MB"]:
+                        logger.error("⛔ Cannot send file: conversion failed and original is invalid.")
+                        continue 
 
-            # Upload
+            # 4. Отправка
             for attempt in range(1, 4):
                 try:
                     is_mp4 = final_file.endswith(".mp4")
@@ -411,6 +434,24 @@ async def processing_cycle(bot, e621, db):
 
 async def health_check(r): return web.Response(text="Alive")
 
+async def scheduler(bot, e621, db):
+    while True:
+        try: await processing_cycle(bot, e621, db)
+        except Exception as e:
+            logger.critical(f"🔥 Critical: {e}")
+            if CONFIG["ADMIN_ID"]:
+                try: await bot.send_message(CONFIG["ADMIN_ID"], f"⚠️ Crash: {e}")
+                except: pass
+
+        # Умный сон до следующего ровного часа
+        now = datetime.datetime.now()
+        next_hour = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        sleep_sec = (next_hour - now).total_seconds()
+        if sleep_sec < 0: sleep_sec = 60
+        
+        logger.info(f"⏳ Sleeping {sleep_sec:.0f}s until {next_hour.strftime('%H:%M')}...")
+        await asyncio.sleep(sleep_sec)
+
 async def main():
     logger.remove()
     logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
@@ -435,19 +476,10 @@ async def main():
         e621 = E621Client(session)
         
         if CONFIG["ADMIN_ID"]:
-            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v14.0 Clean & Simple)")
+            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v16.0 Integrity Fix)")
             except: pass
 
-        while True:
-            try: await processing_cycle(bot, e621, db)
-            except Exception as e:
-                logger.critical(f"🔥 Critical: {e}")
-                if CONFIG["ADMIN_ID"]:
-                    try: await bot.send_message(CONFIG["ADMIN_ID"], f"⚠️ Crash: {e}")
-                    except: pass
-            
-            logger.info(f"⏳ Sleeping {CONFIG['SLEEP_INTERVAL']}s...")
-            await asyncio.sleep(CONFIG["SLEEP_INTERVAL"])
+        await scheduler(bot, e621, db)
 
 if __name__ == "__main__":
     try: asyncio.run(main())
