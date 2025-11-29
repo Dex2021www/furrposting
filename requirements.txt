@@ -5,5 +5,4 @@ faust-cchardet
 uvloop
 asyncpg
 ujson
-cachetools
 loguru
