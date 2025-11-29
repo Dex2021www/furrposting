@@ -10,7 +10,7 @@ import ujson
 import asyncpg
 from aiohttp import web, ClientSession, TCPConnector
 from aiogram import Bot
-from aiogram.types import BufferedInputFile, URLInputFile
+from aiogram.types import BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
@@ -21,7 +21,7 @@ from cachetools import TTLCache
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 DB_DSN = os.getenv("DB_DSN")
-E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/5.1 (by Dexz)")
+E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/6.0 (by Dexz)")
 HEADERS = {"User-Agent": E621_USER_AGENT}
 
 # Теги
@@ -38,7 +38,6 @@ ALLOWED_EXTS = {"webm", "mp4", "gif"}
 BLACKLIST_WORDS = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
 BLACKLIST_SET = set(BLACKLIST_WORDS)
 
-# Игнорируем эти "имена", так как e621 пихает их в категорию Artist
 IGNORED_ARTISTS = {
     "conditional_dnp", "sound_warning", "unknown", "anonymous", 
     "ai_generated", "ai_assisted", "stable_diffusion", "img2img", "midjourney"
@@ -125,7 +124,6 @@ async def get_artist_links(session, artist_name):
                 if data:
                     urls = data[0].get("urls", [])
                     links = []
-                    # Расширенный список сайтов для красивого отображения
                     sites = {
                         "twitter": "Twitter", "x.com": "Twitter", "furaffinity": "FA", 
                         "patreon": "Patreon", "inkbunny": "Inkbunny", "pixiv": "Pixiv", 
@@ -169,12 +167,13 @@ async def parse_post_async(session, post):
     all_tags = set(ptags["general"] + ptags["character"] + ptags["species"] + ptags["copyright"])
     if not all_tags.isdisjoint(BLACKLIST_SET): return None
 
-    # --- ЛОГИКА КАЧЕСТВА ---
+    # --- КАЧЕСТВО ---
     original_size_mb = f["size"] / 1_048_576
     target_url = f["url"]
     target_size = f["size"]
     is_compressed = False
 
+    # Если оригинал больше лимита Telegram, ищем сэмпл
     if original_size_mb > MAX_ORIGINAL_SIZE_MB:
         sample = post.get("sample")
         if sample and sample.get("has") and sample.get("url"):
@@ -182,18 +181,25 @@ async def parse_post_async(session, post):
             target_size = 0 
             is_compressed = True
         else:
-            return None
+            return None # Слишком большой и нет сэмпла
+
+    # --- МЕТАДАННЫЕ ВИДЕО (ВАЖНО ДЛЯ TELEGRAM) ---
+    # Мы явно достаем ширину, высоту и длительность.
+    # Это гарантирует, что Telegram отобразит файл как видео, а не документ.
+    width = f.get("width")
+    height = f.get("height")
+    # Длительность иногда бывает null
+    duration = post.get("duration") 
+    if duration: 
+        duration = int(float(duration))
 
     # --- АВТОРЫ ---
-    # Фильтруем "AI Generated" и прочий мусор из поля Artist
     artists_names = [a for a in ptags["artist"] if a.lower() not in IGNORED_ARTISTS]
-    
     artist_lines = []
-    # Берем топ-3 автора
+    
     for name in artists_names[:3]:
         e621_link = f'<a href="https://e621.net/posts?tags={name}">{name.replace("_", " ").title()}</a>'
         ext_links = await get_artist_links(session, name)
-        # Если есть ссылки, добавляем их в скобках
         line = f"{e621_link} ({' | '.join(ext_links)})" if ext_links else e621_link
         artist_lines.append(line)
 
@@ -216,7 +222,10 @@ async def parse_post_async(session, post):
         "size": target_size, 
         "ext": ext, 
         "caption": caption,
-        "is_compressed": is_compressed
+        "is_compressed": is_compressed,
+        "width": width,
+        "height": height,
+        "duration": duration
     }
 
 
@@ -224,42 +233,32 @@ async def parse_post_async(session, post):
 
 async def send_media(bot, session, meta):
     size_mb = meta["size"] / 1_048_576
-    # ВАЖНО: Мы задаем имя файла, поэтому в Telegram не будет "umxjOp...", а будет "video_123.webm"
     filename = f"video_{meta['id']}.{meta['ext']}"
     
+    # Если размер неизвестен (сэмпл), узнаем его
     if meta["is_compressed"] or size_mb == 0:
         try:
             async with session.head(meta["url"], headers=HEADERS) as resp:
                 if resp.status == 200:
                     content_length = int(resp.headers.get("Content-Length", 0))
                     if content_length > 0:
-                        meta["size"] = content_length
                         size_mb = content_length / 1_048_576
-                        logger.info(f"📏 Resolved sample size: {size_mb:.2f} MB")
-        except Exception as e:
-            logger.warning(f"Could not resolve size: {e}. Assuming RAM download.")
-            size_mb = 25 
+                        logger.info(f"📏 Sample size: {size_mb:.2f} MB")
+        except Exception:
+            size_mb = 25 # Fallback
 
-    try:
-        # 1. URL Upload (< 20 MB)
-        if size_mb < 20:
-            logger.info(f"📤 URL Send [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-            # Передаем filename, чтобы было расширение
-            media = URLInputFile(meta["url"], filename=filename)
-            
-            kwargs = {"chat_id": CHANNEL_ID, "caption": meta["caption"], "parse_mode": ParseMode.HTML}
-            if meta["ext"] == "gif": await bot.send_animation(animation=media, **kwargs)
-            else: await bot.send_video(video=media, supports_streaming=True, **kwargs)
-            return True
-
-        # 2. RAM Upload (20 MB - 49.9 MB)
-        elif size_mb < MAX_ORIGINAL_SIZE_MB:
-            logger.info(f"⬇️ RAM DL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-            
+    # ЕДИНАЯ ЛОГИКА: Всегда качаем в RAM, если влезает в лимит.
+    # Это решает проблему "Документ вместо видео" для мелких файлов по URL.
+    if size_mb < MAX_ORIGINAL_SIZE_MB:
+        logger.info(f"⬇️ RAM DL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
+        
+        try:
             async with session.get(meta["url"], headers=HEADERS) as resp:
-                if resp.status != 200: return False
+                if resp.status != 200:
+                    logger.error(f"DL Fail: {resp.status}")
+                    return False
                 content = await resp.read()
-                
+            
             file_obj = BytesIO(content)
             file_obj.name = filename
             del content
@@ -267,21 +266,38 @@ async def send_media(bot, session, meta):
             logger.info(f"⬆️ RAM Upload...")
             media = BufferedInputFile(file_obj.getvalue(), filename=file_obj.name)
             
-            kwargs = {"chat_id": CHANNEL_ID, "caption": meta["caption"], "parse_mode": ParseMode.HTML}
-            if meta["ext"] == "gif": await bot.send_animation(animation=media, **kwargs)
-            else: await bot.send_video(video=media, supports_streaming=True, **kwargs)
+            kwargs = {
+                "chat_id": CHANNEL_ID,
+                "caption": meta["caption"],
+                "parse_mode": ParseMode.HTML
+            }
+
+            if meta["ext"] == "gif":
+                # Для GIF параметры width/height не так важны, но можно передать
+                await bot.send_animation(animation=media, **kwargs)
+            else:
+                # ВАЖНО: Передаем метаданные видео!
+                await bot.send_video(
+                    video=media, 
+                    supports_streaming=True,
+                    width=meta["width"],
+                    height=meta["height"],
+                    duration=meta["duration"],
+                    **kwargs
+                )
             
             file_obj.close()
             del file_obj
             del media
             gc.collect()
             return True
-        else:
-            logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
+            
+        except Exception as e:
+            logger.error(f"❌ RAM Send Error {meta['id']}: {e}")
             return False
-
-    except Exception as e:
-        logger.error(f"❌ Send Error {meta['id']}: {e}")
+            
+    else:
+        logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
         return False
 
 
