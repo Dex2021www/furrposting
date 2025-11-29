@@ -21,29 +21,31 @@ from cachetools import TTLCache
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 DB_DSN = os.getenv("DB_DSN")
-
-# User-Agent обязателен для всех запросов (API и файлы)
-E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/3.0 (by Dexz)")
+E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/5.1 (by Dexz)")
 HEADERS = {"User-Agent": E621_USER_AGENT}
 
-# Теги поиска
+# Теги
 BASE_TAGS = "-rating:safe order:random -human"
 MIN_SCORE = 130
 
-# Настройки
+# Лимиты
+MAX_ORIGINAL_SIZE_MB = 49.9
+
 VIDEOS_PER_BATCH = 2
 SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", 3600))
-ALLOWED_EXTS = {"webm", "mp4", "gif"}
 
-# Блеклист
+ALLOWED_EXTS = {"webm", "mp4", "gif"}
 BLACKLIST_WORDS = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
 BLACKLIST_SET = set(BLACKLIST_WORDS)
 
-# Кэш для данных об авторах (храним 1000 авторов 24 часа)
-# Это критично для оптимизации API запросов
-ARTIST_CACHE = TTLCache(maxsize=1000, ttl=86400)
+# Игнорируем эти "имена", так как e621 пихает их в категорию Artist
+IGNORED_ARTISTS = {
+    "conditional_dnp", "sound_warning", "unknown", "anonymous", 
+    "ai_generated", "ai_assisted", "stable_diffusion", "img2img", "midjourney"
+}
 
-# Инициализация
+ARTIST_CACHE = TTLCache(maxsize=2000, ttl=86400)
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger.remove()
 logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
@@ -79,10 +81,9 @@ async def mark_as_posted(pool, e621_id):
         await conn.execute("INSERT INTO posted_videos (e621_id) VALUES ($1) ON CONFLICT DO NOTHING", e621_id)
 
 
-# ---------------- [ E621 API & PARSING ] ---------------- #
+# ---------------- [ ПАРСИНГ И API ] ---------------- #
 
 def get_query_tags():
-    # Исключаем картинки и флеш. Оставляем видео и гифки.
     tags = f"{BASE_TAGS} -type:png -type:jpg -type:swf"
     roll = random.random()
     if roll < 0.15:
@@ -111,57 +112,53 @@ async def fetch_posts(session):
         return []
 
 async def get_artist_links(session, artist_name):
-    """
-    Получает ссылки на ресурсы автора (Twitter, FA и т.д.).
-    Использует кэш для экономии запросов.
-    """
-    if artist_name in ARTIST_CACHE:
-        return ARTIST_CACHE[artist_name]
-    
-    if artist_name.lower() in {"unknown", "anonymous", "conditional_dnp"}:
-        return []
+    if artist_name in ARTIST_CACHE: return ARTIST_CACHE[artist_name]
+    if artist_name.lower() in IGNORED_ARTISTS: return []
 
     url = "https://e621.net/artists.json"
     params = {"search[name]": artist_name, "limit": 1}
     
     try:
-        # Небольшой таймаут, чтобы не тормозить весь процесс
         async with session.get(url, params=params, headers=HEADERS, timeout=5) as resp:
             if resp.status == 200:
                 data = await resp.json(loads=ujson.loads)
                 if data:
-                    artist_data = data[0]
-                    # Извлекаем ссылки из поля 'urls'
-                    urls = artist_data.get("urls", [])
-                    # Фильтруем пустые и берем нужные поля
+                    urls = data[0].get("urls", [])
                     links = []
+                    # Расширенный список сайтов для красивого отображения
+                    sites = {
+                        "twitter": "Twitter", "x.com": "Twitter", "furaffinity": "FA", 
+                        "patreon": "Patreon", "inkbunny": "Inkbunny", "pixiv": "Pixiv", 
+                        "bluesky": "Bluesky", "bsky.app": "Bluesky", "newgrounds": "Newgrounds",
+                        "weasyl": "Weasyl", "kobold": "Kobold", "sofurry": "SoFurry",
+                        "deviantart": "DA", "tumblr": "Tumblr", "ko-fi": "Ko-fi",
+                        "gumroad": "Gumroad", "subscribestar": "SubStar", "itaku": "Itaku"
+                    }
                     for u in urls:
                         addr = u.get("url", "")
                         if not addr: continue
-                        
-                        # Красивое название для ссылки
                         name = "Link"
-                        if "twitter" in addr or "x.com" in addr: name = "Twitter"
-                        elif "furaffinity" in addr: name = "FA"
-                        elif "patreon" in addr: name = "Patreon"
-                        elif "inkbunny" in addr: name = "Inkbunny"
-                        elif "pixiv" in addr: name = "Pixiv"
-                        elif "bluesky" in addr or "bsky.app" in addr: name = "Bluesky"
-                        
+                        for key, val in sites.items():
+                            if key in addr:
+                                name = val
+                                break
                         links.append(f'<a href="{addr}">{name}</a>')
                     
-                    # Сохраняем топ-3 ссылки, чтобы не спамить
-                    result = links[:4]
-                    ARTIST_CACHE[artist_name] = result
-                    return result
-    except Exception:
-        pass # Если ошибка API, просто возвращаем пустоту
-    
-    ARTIST_CACHE[artist_name] = [] # Кэшируем пустоту, чтобы не долбить API снова
+                    seen = set()
+                    unique_links = []
+                    for l in links:
+                        if l not in seen:
+                            unique_links.append(l)
+                            seen.add(l)
+                            if len(unique_links) >= 3: break
+                    
+                    ARTIST_CACHE[artist_name] = unique_links
+                    return unique_links
+    except Exception: pass 
+    ARTIST_CACHE[artist_name] = [] 
     return []
 
 async def parse_post_async(session, post):
-    """Асинхронный парсинг поста с подгрузкой инфо об авторе."""
     f = post.get("file")
     if not f or not f.get("url"): return None
     ext = f["ext"]
@@ -172,111 +169,115 @@ async def parse_post_async(session, post):
     all_tags = set(ptags["general"] + ptags["character"] + ptags["species"] + ptags["copyright"])
     if not all_tags.isdisjoint(BLACKLIST_SET): return None
 
-    # Обработка автора
-    artists_names = ptags["artist"]
-    # Исключаем служебные теги
-    valid_artists = [a for a in artists_names if a not in ["conditional_dnp", "sound_warning"]]
-    
-    artist_block = ""
-    if valid_artists:
-        # Берем первого основного автора для поиска ссылок
-        main_artist = valid_artists[0]
-        links = await get_artist_links(session, main_artist)
-        
-        # Ссылка на тег e621
-        e621_artist_link = f'<a href="https://e621.net/posts?tags={main_artist}">{main_artist.replace("_", " ").title()}</a>'
-        
-        if links:
-            # Формат: ArtistName (Twitter | Patreon)
-            links_str = " | ".join(links)
-            artist_block = f"<b>Artist:</b> {e621_artist_link} ({links_str})"
+    # --- ЛОГИКА КАЧЕСТВА ---
+    original_size_mb = f["size"] / 1_048_576
+    target_url = f["url"]
+    target_size = f["size"]
+    is_compressed = False
+
+    if original_size_mb > MAX_ORIGINAL_SIZE_MB:
+        sample = post.get("sample")
+        if sample and sample.get("has") and sample.get("url"):
+            target_url = sample["url"]
+            target_size = 0 
+            is_compressed = True
         else:
-            artist_block = f"<b>Artist:</b> {e621_artist_link}"
-    else:
-        artist_block = "<b>Artist:</b> Unknown"
+            return None
 
-    # Источник (Source) из самого поста
-    sources = post.get("sources", [])
-    source_link_e621 = f"https://e621.net/posts/{post['id']}"
+    # --- АВТОРЫ ---
+    # Фильтруем "AI Generated" и прочий мусор из поля Artist
+    artists_names = [a for a in ptags["artist"] if a.lower() not in IGNORED_ARTISTS]
     
-    # Если есть внешний источник (Twitter, etc), указываем его
-    if sources and sources[0]:
-        # Обрезаем длинные ссылки для красоты (опционально)
-        direct_source = f"<a href='{sources[0]}'>Original</a>"
-        source_block = f"<b>Source:</b> {direct_source} | <a href='{source_link_e621}'>e621</a>"
-    else:
-        source_block = f"<b>Source:</b> <a href='{source_link_e621}'>e621</a>"
+    artist_lines = []
+    # Берем топ-3 автора
+    for name in artists_names[:3]:
+        e621_link = f'<a href="https://e621.net/posts?tags={name}">{name.replace("_", " ").title()}</a>'
+        ext_links = await get_artist_links(session, name)
+        # Если есть ссылки, добавляем их в скобках
+        line = f"{e621_link} ({' | '.join(ext_links)})" if ext_links else e621_link
+        artist_lines.append(line)
 
-    caption = f"{artist_block}\n{source_block}"
+    if not artist_lines: artist_block = "<b>Artist:</b> Unknown"
+    elif len(artist_lines) > 1: artist_block = f"<b>Artists:</b> \n          " + "\n          ".join(artist_lines)
+    else: artist_block = f"<b>Artist:</b> {artist_lines[0]}"
     
-    return {"id": post["id"], "url": f["url"], "size": f["size"], "ext": ext, "caption": caption}
+    if len(artists_names) > 3: artist_block += f" <i>(+{len(artists_names)-3} others)</i>"
+
+    # --- ИСТОЧНИК ---
+    source_link = f"https://e621.net/posts/{post['id']}"
+    source_block = f"<b>Source:</b> <a href='{source_link}'>e621</a>"
+
+    quality_tag = " <i>(Compressed)</i>" if is_compressed else ""
+    caption = f"{artist_block}\n{source_block}{quality_tag}"
+    
+    return {
+        "id": post["id"], 
+        "url": target_url, 
+        "size": target_size, 
+        "ext": ext, 
+        "caption": caption,
+        "is_compressed": is_compressed
+    }
 
 
-# ---------------- [ SENDING LOGIC ] ---------------- #
+# ---------------- [ ОТПРАВКА ] ---------------- #
 
 async def send_media(bot, session, meta):
-    size_mb = meta["size"] / 1_048_576 
-    is_gif = meta["ext"] == "gif"
-    filename = f"video_{meta['id']}.{meta['ext']}" # Явное имя файла!
+    size_mb = meta["size"] / 1_048_576
+    # ВАЖНО: Мы задаем имя файла, поэтому в Telegram не будет "umxjOp...", а будет "video_123.webm"
+    filename = f"video_{meta['id']}.{meta['ext']}"
     
+    if meta["is_compressed"] or size_mb == 0:
+        try:
+            async with session.head(meta["url"], headers=HEADERS) as resp:
+                if resp.status == 200:
+                    content_length = int(resp.headers.get("Content-Length", 0))
+                    if content_length > 0:
+                        meta["size"] = content_length
+                        size_mb = content_length / 1_048_576
+                        logger.info(f"📏 Resolved sample size: {size_mb:.2f} MB")
+        except Exception as e:
+            logger.warning(f"Could not resolve size: {e}. Assuming RAM download.")
+            size_mb = 25 
+
     try:
-        # 1. URL Sending (< 20 MB)
+        # 1. URL Upload (< 20 MB)
         if size_mb < 20:
             logger.info(f"📤 URL Send [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-            media_file = URLInputFile(meta["url"], filename=filename)
+            # Передаем filename, чтобы было расширение
+            media = URLInputFile(meta["url"], filename=filename)
             
-            func = bot.send_animation if is_gif else bot.send_video
-            kwargs = {
-                "chat_id": CHANNEL_ID,
-                "caption": meta["caption"],
-                "parse_mode": ParseMode.HTML
-            }
-            if is_gif: kwargs["animation"] = media_file
-            else: 
-                kwargs["video"] = media_file
-                kwargs["supports_streaming"] = True
-            
-            await func(**kwargs)
+            kwargs = {"chat_id": CHANNEL_ID, "caption": meta["caption"], "parse_mode": ParseMode.HTML}
+            if meta["ext"] == "gif": await bot.send_animation(animation=media, **kwargs)
+            else: await bot.send_video(video=media, supports_streaming=True, **kwargs)
             return True
 
-        # 2. RAM Upload (20-50 MB)
-        elif size_mb < 50:
+        # 2. RAM Upload (20 MB - 49.9 MB)
+        elif size_mb < MAX_ORIGINAL_SIZE_MB:
             logger.info(f"⬇️ RAM DL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
             
-            # ВАЖНО: Передаем HEADERS при скачивании!
             async with session.get(meta["url"], headers=HEADERS) as resp:
-                if resp.status != 200:
-                    logger.error(f"DL Fail: {resp.status}")
-                    return False
+                if resp.status != 200: return False
                 content = await resp.read()
                 
             file_obj = BytesIO(content)
-            file_obj.name = filename # Имя файла критично для Telegram
+            file_obj.name = filename
             del content
             
             logger.info(f"⬆️ RAM Upload...")
-            file_input = BufferedInputFile(file_obj.getvalue(), filename=file_obj.name)
+            media = BufferedInputFile(file_obj.getvalue(), filename=file_obj.name)
             
-            func = bot.send_animation if is_gif else bot.send_video
-            kwargs = {
-                "chat_id": CHANNEL_ID,
-                "caption": meta["caption"],
-                "parse_mode": ParseMode.HTML
-            }
-            if is_gif: kwargs["animation"] = file_input
-            else:
-                kwargs["video"] = file_input
-                kwargs["supports_streaming"] = True
-
-            await func(**kwargs)
+            kwargs = {"chat_id": CHANNEL_ID, "caption": meta["caption"], "parse_mode": ParseMode.HTML}
+            if meta["ext"] == "gif": await bot.send_animation(animation=media, **kwargs)
+            else: await bot.send_video(video=media, supports_streaming=True, **kwargs)
             
             file_obj.close()
             del file_obj
-            del file_input
+            del media
             gc.collect()
             return True
         else:
-            logger.warning(f"⚠️ Too big: {size_mb:.2f} MB")
+            logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
             return False
 
     except Exception as e:
@@ -297,7 +298,6 @@ async def processing_cycle(bot, session, pool):
     for post in new_posts:
         if sent_count >= VIDEOS_PER_BATCH: break
         
-        # Теперь парсинг асинхронный (запрашивает ссылки автора)
         meta = await parse_post_async(session, post)
         if not meta: continue
         
@@ -309,7 +309,7 @@ async def processing_cycle(bot, session, pool):
     logger.info(f"--- ✅ Done. Sent: {sent_count} ---")
 
 
-# ---------------- [ SERVER & MAIN ] ---------------- #
+# ---------------- [ MAIN ] ---------------- #
 
 async def health_check(request): return web.Response(text="Alive")
 
@@ -334,7 +334,6 @@ async def scheduler(bot, session, pool):
 async def main():
     pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=2)
     await init_db(pool)
-    # Используем HEADERS по умолчанию для всей сессии
     async with ClientSession(connector=TCPConnector(limit=10, ssl=False), 
                              json_serialize=ujson.dumps,
                              headers=HEADERS) as session:
