@@ -7,3 +7,4 @@ asyncpg
 ujson
 loguru
 cachetools
+imageio-ffmpeg

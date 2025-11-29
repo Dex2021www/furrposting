@@ -3,6 +3,7 @@ import asyncio
 import gc
 import random
 import os
+import tempfile
 from io import BytesIO
 
 import uvloop
@@ -10,7 +11,7 @@ import ujson
 import asyncpg
 from aiohttp import web, ClientSession, TCPConnector
 from aiogram import Bot
-from aiogram.types import BufferedInputFile
+from aiogram.types import FSInputFile, BufferedInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
@@ -21,12 +22,16 @@ from cachetools import TTLCache
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 DB_DSN = os.getenv("DB_DSN")
-E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/7.0 (by Dexz)")
+E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/8.0 (by Dexz)")
 HEADERS = {"User-Agent": E621_USER_AGENT}
 
 BASE_TAGS = "-rating:safe order:random -human"
 MIN_SCORE = 130
 MAX_ORIGINAL_SIZE_MB = 49.9
+
+# Сколько времени даем на конвертацию (секунд). 
+# На 0.1 CPU лучше не ставить слишком много, чтобы не вешать бота.
+CONVERT_TIMEOUT = 90 
 
 VIDEOS_PER_BATCH = 2
 SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", 3600))
@@ -77,6 +82,56 @@ async def mark_as_posted(pool, e621_id):
         await conn.execute("INSERT INTO posted_videos (e621_id) VALUES ($1) ON CONFLICT DO NOTHING", e621_id)
 
 
+# ---------------- [ КОНВЕРТАЦИЯ (FFMPEG) ] ---------------- #
+
+async def convert_to_mp4(input_path, output_path):
+    """
+    Конвертирует WebM -> MP4 с жесткой оптимизацией под слабый CPU.
+    Возвращает True, если успешно.
+    """
+    # Аргументы FFmpeg:
+    # -y : перезаписать файл
+    # -vf scale='min(640,iw)':-2 : Если видео шире 640px, уменьшаем до 640. Это спасает CPU!
+    # -preset ultrafast : Максимальная скорость кодирования (ценой размера файла)
+    # -crf 28 : Немного снижаем качество для скорости
+    # -c:a aac : Аудио кодек
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", input_path,
+        "-vf", "scale='min(640,iw)':-2", 
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        # Ждем с таймаутом
+        await asyncio.wait_for(process.wait(), timeout=CONVERT_TIMEOUT)
+        
+        if process.returncode == 0:
+            return True
+        else:
+            _, stderr = await process.communicate()
+            logger.error(f"FFmpeg failed: {stderr.decode()}")
+            return False
+            
+    except asyncio.TimeoutError:
+        logger.warning("⏱️ Conversion timed out! CPU is too slow.")
+        try: process.kill()
+        except: pass
+        return False
+    except FileNotFoundError:
+        logger.error("❌ FFmpeg not installed on server!")
+        return False
+    except Exception as e:
+        logger.error(f"Convert error: {e}")
+        return False
+
+
 # ---------------- [ ПАРСИНГ ] ---------------- #
 
 def get_query_tags():
@@ -98,14 +153,10 @@ async def fetch_posts(session):
     params = {"tags": f"{get_query_tags()} score:>={MIN_SCORE}", "limit": 50}
     try:
         async with session.get(url, params=params, headers=HEADERS) as response:
-            if response.status != 200:
-                logger.error(f"❌ API Error: {response.status}")
-                return []
+            if response.status != 200: return []
             data = await response.json(loads=ujson.loads)
             return data.get("posts", [])
-    except Exception as e:
-        logger.error(f"❌ Fetch Error: {e}")
-        return []
+    except Exception: return []
 
 async def get_artist_links(session, artist_name):
     if artist_name in ARTIST_CACHE: return ARTIST_CACHE[artist_name]
@@ -133,8 +184,7 @@ async def get_artist_links(session, artist_name):
                         if not addr: continue
                         name = "Link"
                         for key, val in sites.items():
-                            if key in addr:
-                                name = val; break
+                            if key in addr: name = val; break
                         links.append(f'<a href="{addr}">{name}</a>')
                     
                     seen = set(); unique_links = []
@@ -178,10 +228,6 @@ async def parse_post_async(session, post):
     height = f.get("height")
     duration = post.get("duration") 
     if duration: duration = int(float(duration))
-
-    # --- ПРЕВЬЮ (THUMBNAIL) ---
-    # Берем sample url (средний размер) или preview url (маленький)
-    # Это нужно, чтобы Телеграм не показывал видео как файл
     preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
 
     # Авторы
@@ -207,17 +253,16 @@ async def parse_post_async(session, post):
         "id": post["id"], "url": target_url, "size": target_size, "ext": ext, 
         "caption": caption, "is_compressed": is_compressed,
         "width": width, "height": height, "duration": duration,
-        "preview_url": preview_url # Ссылка на картинку
+        "preview_url": preview_url
     }
 
 
-# ---------------- [ ОТПРАВКА ] ---------------- #
+# ---------------- [ ОТПРАВКА С КОНВЕРТАЦИЕЙ ] ---------------- #
 
 async def send_media(bot, session, meta):
     size_mb = meta["size"] / 1_048_576
-    filename = f"video_{meta['id']}.{meta['ext']}"
     
-    # Узнаем размер, если это сэмпл
+    # Узнаем размер, если сэмпл
     if meta["is_compressed"] or size_mb == 0:
         try:
             async with session.head(meta["url"], headers=HEADERS) as resp:
@@ -226,37 +271,69 @@ async def send_media(bot, session, meta):
                     if cl > 0: size_mb = cl / 1_048_576
         except Exception: size_mb = 25 
 
-    if size_mb < MAX_ORIGINAL_SIZE_MB:
-        logger.info(f"⬇️ RAM DL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
-        
-        video_bytes = None
-        thumb_obj = None # Объект для обложки
+    if size_mb >= MAX_ORIGINAL_SIZE_MB:
+        logger.warning(f"⚠️ Skip: too big ({size_mb:.2f} MB)")
+        return False
 
+    logger.info(f"⬇️ Processing [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
+
+    # Создаем временные файлы для конвертации
+    # Используем tempfile, чтобы не забивать RAM
+    with tempfile.TemporaryDirectory() as temp_dir:
+        input_file = os.path.join(temp_dir, f"input.{meta['ext']}")
+        output_file = os.path.join(temp_dir, f"video_{meta['id']}.mp4")
+        thumb_path = os.path.join(temp_dir, "thumb.jpg")
+        
+        # 1. Скачиваем файл на диск
         try:
-            # 1. Скачиваем ВИДЕО
             async with session.get(meta["url"], headers=HEADERS) as resp:
                 if resp.status != 200: return False
-                video_bytes = await resp.read()
-            
-            video_io = BytesIO(video_bytes)
-            video_io.name = filename
-            del video_bytes
-            
-            # 2. Скачиваем ОБЛОЖКУ (если есть)
-            # Это ключевой момент для отображения плеера!
-            if meta["preview_url"] and meta["ext"] != "gif":
-                try:
-                    async with session.get(meta["preview_url"], headers=HEADERS) as t_resp:
-                        if t_resp.status == 200:
-                            t_bytes = await t_resp.read()
-                            t_io = BytesIO(t_bytes)
-                            t_io.name = "thumb.jpg"
-                            thumb_obj = BufferedInputFile(t_io.getvalue(), filename="thumb.jpg")
-                except Exception as e:
-                    logger.warning(f"Thumb DL failed: {e}")
+                with open(input_file, 'wb') as f:
+                    while True:
+                        chunk = await resp.content.read(65536) # 64KB chunks
+                        if not chunk: break
+                        f.write(chunk)
+        except Exception as e:
+            logger.error(f"DL Error: {e}")
+            return False
 
-            logger.info(f"⬆️ RAM Upload...")
-            media = BufferedInputFile(video_io.getvalue(), filename=video_io.name)
+        # 2. Скачиваем обложку (нужна в любом случае)
+        has_thumb = False
+        if meta["preview_url"] and meta["ext"] != "gif":
+            try:
+                async with session.get(meta["preview_url"], headers=HEADERS) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        with open(thumb_path, 'wb') as f: f.write(data)
+                        has_thumb = True
+            except: pass
+
+        final_file_path = input_file
+        final_ext = meta["ext"]
+
+        # 3. КОНВЕРТАЦИЯ (Только если это WebM и не GIF)
+        # Если GIF - шлем как есть. Если WebM - пытаемся сделать MP4.
+        if meta["ext"] == "webm":
+            logger.info("⚙️ Converting WebM -> MP4 (CPU intensive)...")
+            success = await convert_to_mp4(input_file, output_file)
+            
+            if success:
+                # Проверяем размер после конвертации
+                out_size_mb = os.path.getsize(output_file) / 1_048_576
+                if out_size_mb < MAX_ORIGINAL_SIZE_MB:
+                    logger.info(f"✅ Converted! Size: {out_size_mb:.2f} MB")
+                    final_file_path = output_file
+                    final_ext = "mp4"
+                else:
+                    logger.warning(f"⚠️ MP4 too big ({out_size_mb:.2f} MB), reverting to WebM")
+            else:
+                logger.warning("⚠️ Conversion failed, sending original WebM")
+
+        # 4. Отправка в Telegram
+        try:
+            # FSInputFile читает с диска, экономит RAM
+            video_file = FSInputFile(final_file_path, filename=f"video_{meta['id']}.{final_ext}")
+            thumb_file = FSInputFile(thumb_path) if has_thumb else None
             
             kwargs = {
                 "chat_id": CHANNEL_ID,
@@ -264,32 +341,27 @@ async def send_media(bot, session, meta):
                 "parse_mode": ParseMode.HTML
             }
 
+            logger.info(f"⬆️ Uploading...")
             if meta["ext"] == "gif":
-                await bot.send_animation(animation=media, **kwargs)
+                await bot.send_animation(animation=video_file, **kwargs)
             else:
                 await bot.send_video(
-                    video=media, 
+                    video=video_file, 
                     supports_streaming=True,
                     width=meta["width"],
                     height=meta["height"],
                     duration=meta["duration"],
-                    thumbnail=thumb_obj, # <--- ПЕРЕДАЕМ ОБЛОЖКУ
+                    thumbnail=thumb_file,
                     **kwargs
                 )
             
-            video_io.close()
-            del video_io
-            del media
-            if thumb_obj: del thumb_obj
+            # Файлы удалятся автоматически при выходе из with tempfile
             gc.collect()
             return True
-            
+
         except Exception as e:
-            logger.error(f"❌ RAM Send Error {meta['id']}: {e}")
+            logger.error(f"❌ Upload Error: {e}")
             return False
-    else:
-        logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
-        return False
 
 
 async def processing_cycle(bot, session, pool):
