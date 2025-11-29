@@ -6,456 +6,492 @@ import os
 import tempfile
 import glob
 import html
+import shutil
 from urllib.parse import urlparse
-from io import BytesIO
 
-# Библиотека для автоматического поиска/установки FFmpeg
-import imageio_ffmpeg 
-
+# Сторонние библиотеки
+import imageio_ffmpeg
 import uvloop
 import ujson
 import asyncpg
-from aiohttp import web, ClientSession, TCPConnector, ClientTimeout
+from aiohttp import ClientSession, TCPConnector, ClientTimeout, web
 from aiogram import Bot
-from aiogram.types import FSInputFile, BufferedInputFile
+from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
 from cachetools import TTLCache
 
-# ---------------- [ КОНФИГУРАЦИЯ ] ---------------- #
+# ===========================
+# ⚙️ CONFIGURATION
+# ===========================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-ADMIN_ID = os.getenv("ADMIN_ID") # Для алертов
-DB_DSN = os.getenv("DB_DSN")
+CONFIG = {
+    "BOT_TOKEN": os.getenv("BOT_TOKEN"),
+    "CHANNEL_ID": os.getenv("CHANNEL_ID"),
+    "ADMIN_ID": os.getenv("ADMIN_ID"),
+    "DB_DSN": os.getenv("DB_DSN"),
+    "USER_AGENT": os.getenv("E621_USER_AGENT", "TgBot/13.0 (Optimized for 0.1CPU)"),
+    "SLEEP_INTERVAL": int(os.getenv("SLEEP_INTERVAL", 3600)),
+    "VIDEOS_PER_BATCH": 2,
+    "MIN_SCORE": 200,
+    # Максимальный размер для скачивания и попытки сжатия
+    "MAX_DOWNLOAD_MB": 80.0, 
+    # Максимальный размер итогового файла для Telegram
+    "MAX_TG_MB": 49.9,
+    # Таймаут конвертации (10 минут)
+    "CONVERT_TIMEOUT": 600
+}
 
-E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/11.0 (by Dexz)")
-HEADERS = {"User-Agent": E621_USER_AGENT}
+# Теги: Исключаем безопасное, людей, картинки, флеш
+BASE_TAGS = "-rating:safe order:random -human -type:png -type:jpg -type:swf"
 
-# Теги: Исключаем безопасное, рандом, без людей
-BASE_TAGS = "-rating:safe order:random -human"
-MIN_SCORE = 130
-MAX_ORIGINAL_SIZE_MB = 49.9
-
-# Таймауты
-CONVERT_TIMEOUT = 300 # 5 минут на конвертацию
-NETWORK_TIMEOUT = ClientTimeout(total=600, connect=10) # 10 сек на коннект, 10 мин на скачивание
-
-VIDEOS_PER_BATCH = 2
-SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", 3600))
-
-ALLOWED_EXTS = {"webm", "mp4", "gif"}
-BLACKLIST_WORDS = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
-BLACKLIST_SET = set(BLACKLIST_WORDS)
-
-# Игнорируем системные имена в поле Artist
+# Игнорируемые "художники"
 IGNORED_ARTISTS = {
-    "conditional_dnp", "sound_warning", "unknown", "anonymous", 
+    "conditional_dnp", "sound_warning", "unknown", "anonymous",
     "ai_generated", "ai_assisted", "stable_diffusion", "img2img", "midjourney"
 }
 
+# Кэш для ссылок авторов
 ARTIST_CACHE = TTLCache(maxsize=2000, ttl=86400)
 
-# Максимальная оптимизация Event Loop
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-logger.remove()
-logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
-
-if not BOT_TOKEN or not CHANNEL_ID or not DB_DSN:
-    logger.critical("❌ Variables BOT_TOKEN, CHANNEL_ID, DB_DSN are missing!")
+# Проверка переменных
+if not all([CONFIG["BOT_TOKEN"], CONFIG["CHANNEL_ID"], CONFIG["DB_DSN"]]):
+    logger.critical("❌ Missing Environment Variables!")
     sys.exit(1)
 
+# Установка быстрого лупа
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-# ---------------- [ СИСТЕМНЫЕ УТИЛИТЫ ] ---------------- #
+# ===========================
+# 🛠️ UTILITIES
+# ===========================
 
-async def send_alert(bot, message):
-    """Шлет уведомление админу в ЛС при критических сбоях."""
-    if not ADMIN_ID: return
+def clean_temp_dir():
+    """Чистит временные файлы при старте."""
     try:
-        await bot.send_message(chat_id=ADMIN_ID, text=f"⚠️ <b>Bot Alert:</b>\n{html.escape(str(message))}")
-    except Exception as e:
-        logger.error(f"Failed to send alert: {e}")
-
-def clean_temp_garbage():
-    """Чистит папку tmp от 'зомби-файлов' при старте."""
-    try:
-        tmp_dir = tempfile.gettempdir()
-        files = glob.glob(os.path.join(tmp_dir, "video_*")) + glob.glob(os.path.join(tmp_dir, "thumb_*")) + glob.glob(os.path.join(tmp_dir, "in.*"))
+        tmp = tempfile.gettempdir()
         count = 0
-        for f in files:
+        for p in glob.glob(os.path.join(tmp, "bot_temp_*")):
             try:
-                if os.path.isfile(f):
-                    os.remove(f)
-                    count += 1
+                os.remove(p)
+                count += 1
             except: pass
-        if count > 0:
-            logger.info(f"🧹 Startup Cleanup: Removed {count} old temp files.")
+        if count: logger.info(f"🧹 Cleaned {count} old temp files.")
     except Exception as e:
-        logger.warning(f"Cleanup warning: {e}")
+        logger.warning(f"Cleanup error: {e}")
 
-def smart_domain_name(url):
-    """
-    (v11.0 Feature) Умное извлечение названия сайта.
-    fanbox.cc -> Fanbox, twitter.com -> Twitter, boosty.to -> Boosty
-    """
+def get_site_name(url):
+    """Превращает ссылку в красивое название сайта."""
     try:
-        domain = urlparse(url).netloc
-        # Убираем www.
-        if domain.startswith("www."): domain = domain[4:]
-        # Берем первую часть домена (twitter.com -> twitter)
-        name = domain.split('.')[0]
-        
-        # Словарь красивых исключений
-        overrides = {
-            "furaffinity": "FA", "inkbunny": "Inkbunny", "deviantart": "DeviantArt",
-            "sofurry": "SoFurry", "newgrounds": "Newgrounds", "subscribestar": "SubStar",
-            "bsky": "Bluesky", "t": "Telegram", "vk": "VK"
+        domain = urlparse(url).netloc.replace("www.", "").split('.')[0].lower()
+        mapping = {
+            "twitter": "Twitter", "x": "Twitter", "furaffinity": "FA",
+            "patreon": "Patreon", "inkbunny": "Inkbunny", "pixiv": "Pixiv",
+            "bluesky": "Bluesky", "bsky": "Bluesky", "gumroad": "Gumroad",
+            "ko-fi": "Ko-fi", "subscribestar": "SubStar", "newgrounds": "Newgrounds",
+            "t": "Telegram", "vk": "VK", "sofurry": "SoFurry"
         }
-        return overrides.get(name.lower(), name.capitalize())
-    except:
-        return "Link"
+        return mapping.get(domain, domain.capitalize())
+    except: return "Link"
 
+# ===========================
+# 🗄️ DATABASE CLASS
+# ===========================
 
-# ---------------- [ БАЗА ДАННЫХ ] ---------------- #
+class Database:
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.pool = None
 
-async def init_db(pool):
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS posted_videos (
-                id SERIAL PRIMARY KEY,
-                e621_id INT UNIQUE NOT NULL,
-                md5_hash TEXT, 
-                posted_at TIMESTAMP DEFAULT NOW()
-            );
-            CREATE INDEX IF NOT EXISTS idx_e621_id ON posted_videos(e621_id);
-            CREATE INDEX IF NOT EXISTS idx_md5 ON posted_videos(md5_hash);
-        """)
-        # Миграция для старых баз
-        try: await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
-        except: pass
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=2)
+        await self._init_schema()
 
-async def check_db_health(pool):
-    """Keepalive: Пингуем базу, если уснула - пересоздаем."""
-    try:
-        async with pool.acquire() as conn:
-            await conn.execute("SELECT 1")
-        return pool
-    except Exception as e:
-        logger.warning(f"🔌 DB Connection lost ({e}). Reconnecting...")
-        try: await pool.close()
-        except: pass
-        return await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=2)
-
-async def filter_new_posts(pool, posts_data):
-    if not posts_data: return []
-    
-    candidate_ids = [p['id'] for p in posts_data]
-    candidate_md5s = [p.get('file', {}).get('md5') for p in posts_data if p.get('file', {}).get('md5')]
-
-    async with pool.acquire() as conn:
-        rows_id = await conn.fetch("SELECT e621_id FROM posted_videos WHERE e621_id = ANY($1::int[])", candidate_ids)
-        existing_ids = {r['e621_id'] for r in rows_id}
-        
-        existing_md5s = set()
-        if candidate_md5s:
-            rows_md5 = await conn.fetch("SELECT md5_hash FROM posted_videos WHERE md5_hash = ANY($1::text[])", candidate_md5s)
-            existing_md5s = {r['md5_hash'] for r in rows_md5 if r['md5_hash']}
-
-    final_posts = []
-    for p in posts_data:
-        if p['id'] in existing_ids: continue
-        if p.get('file', {}).get('md5') in existing_md5s: continue
-        final_posts.append(p)
-        
-    return final_posts
-
-async def mark_as_posted(pool, post_id, md5):
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO posted_videos (e621_id, md5_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING", 
-            post_id, md5
-        )
-
-
-# ---------------- [ КОНВЕРТАЦИЯ ] ---------------- #
-
-async def convert_to_mp4(input_path, output_path):
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    
-    # nice -n 15: Низкий приоритет CPU
-    # scale='min(640,iw)': Сжатие разрешения для скорости
-    cmd = [
-        "nice", "-n", "15", 
-        ffmpeg_exe, "-y", "-v", "error",
-        "-i", input_path,
-        "-vf", "scale='min(640,iw)':-2", 
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-        )
-        await asyncio.wait_for(process.wait(), timeout=CONVERT_TIMEOUT)
-        
-        if process.returncode == 0: return True
-        else:
-            _, stderr = await process.communicate()
-            logger.error(f"FFmpeg failed: {stderr.decode()}")
-            return False
-            
-    except asyncio.TimeoutError:
-        logger.warning("⏱️ Conversion timed out.")
-        try: process.kill()
-        except: pass
-        return False
-    except Exception as e:
-        logger.error(f"Convert error: {e}"); return False
-
-
-# ---------------- [ ПАРСИНГ ] ---------------- #
-
-def get_query_tags():
-    tags = f"{BASE_TAGS} -type:png -type:jpg -type:swf"
-    roll = random.random()
-    if roll < 0.15: tags += " date:<6months"; mode = "Fresh"
-    elif roll < 0.35: tags += " date:<1year"; mode = "Modern"
-    else: mode = "Legacy"
-    logger.info(f"🎲 {mode} | Query: {tags}")
-    return tags
-
-async def fetch_posts(session):
-    try:
-        url = "https://e621.net/posts.json"
-        params = {"tags": f"{get_query_tags()} score:>={MIN_SCORE}", "limit": 50}
-        async with session.get(url, params=params, headers=HEADERS) as resp:
-            if resp.status != 200: return []
-            data = await resp.json(loads=ujson.loads)
-            return data.get("posts", [])
-    except: return []
-
-async def get_artist_links(session, artist_name):
-    if artist_name in ARTIST_CACHE: return ARTIST_CACHE[artist_name]
-    if artist_name.lower() in IGNORED_ARTISTS: return []
-
-    try:
-        url = "https://e621.net/artists.json"
-        params = {"search[name]": artist_name, "limit": 1}
-        async with session.get(url, params=params, headers=HEADERS, timeout=5) as resp:
-            if resp.status == 200:
-                data = await resp.json(loads=ujson.loads)
-                if data:
-                    urls = data[0].get("urls", [])
-                    links = []
-                    for u in urls:
-                        addr = u.get("url", "")
-                        if not addr: continue
-                        # (v11.0) Умное определение названия сайта
-                        name = smart_domain_name(addr)
-                        links.append(f'<a href="{addr}">{name}</a>')
-                    
-                    seen = set(); unique = []
-                    for l in links:
-                        if l not in seen:
-                            unique.append(l); seen.add(l)
-                            if len(unique) >= 3: break 
-                    ARTIST_CACHE[artist_name] = unique
-                    return unique
-    except: pass 
-    ARTIST_CACHE[artist_name] = [] 
-    return []
-
-async def parse_post_async(session, post):
-    f = post.get("file")
-    if not f or not f.get("url"): return None
-    ext = f["ext"]
-    if ext not in ALLOWED_EXTS: return None
-    
-    ptags = post["tags"]
-    all_tags = set(ptags["general"] + ptags["character"] + ptags["species"] + ptags["copyright"])
-    if not all_tags.isdisjoint(BLACKLIST_SET): return None
-
-    # Quality check
-    orig_mb = f["size"] / 1_048_576
-    target_url = f["url"]; target_size = f["size"]; is_compressed = False
-    
-    if orig_mb > MAX_ORIGINAL_SIZE_MB:
-        sample = post.get("sample")
-        if sample and sample.get("has") and sample.get("url"):
-            target_url = sample["url"]; target_size = 0; is_compressed = True
-        else: return None 
-
-    # --- TEXT GENERATION ---
-    artists_names = [a for a in ptags["artist"] if a.lower() not in IGNORED_ARTISTS]
-    artist_lines = []
-    
-    for name in artists_names[:3]:
-        # (v11.0) Escaping: Защита от спецсимволов в никах (<, &, >)
-        safe_name = html.escape(name.replace("_", " ").title())
-        e621_link = f'<a href="https://e621.net/posts?tags={name}">{safe_name}</a>'
-        
-        ext_links = await get_artist_links(session, name)
-        line = f"{e621_link} ({' | '.join(ext_links)})" if ext_links else e621_link
-        artist_lines.append(line)
-
-    if not artist_lines: artist_block = "<b>Artist:</b> Unknown"
-    elif len(artist_lines) > 1: artist_block = f"<b>Artists:</b> \n          " + "\n          ".join(artist_lines)
-    else: artist_block = f"<b>Artist:</b> {artist_lines[0]}"
-    if len(artists_names) > 3: artist_block += f" <i>(+{len(artists_names)-3} others)</i>"
-
-    source_link = f"https://e621.net/posts/{post['id']}"
-    source_block = f"<b>Source:</b> <a href='{source_link}'>e621</a>"
-    quality_tag = " <i>(Compressed)</i>" if is_compressed else ""
-    caption = f"{artist_block}\n{source_block}{quality_tag}"
-    
-    return {
-        "id": post["id"], "md5": f.get("md5"), "url": target_url, "size": target_size, "ext": ext, 
-        "caption": caption, "is_compressed": is_compressed,
-        "width": f.get("width"), "height": f.get("height"), 
-        "duration": int(float(post.get("duration") or 0)),
-        "preview_url": post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
-    }
-
-
-# ---------------- [ SENDING LOGIC ] ---------------- #
-
-async def send_media(bot, session, meta):
-    size_mb = meta["size"] / 1_048_576
-    if meta["is_compressed"] or size_mb == 0:
-        try:
-            async with session.head(meta["url"], headers=HEADERS) as r:
-                if r.status==200: size_mb = int(r.headers.get("Content-Length",0))/1048576
-        except: size_mb = 25 
-
-    if size_mb >= MAX_ORIGINAL_SIZE_MB: return False
-    logger.info(f"⬇️ Processing {meta['id']} ({size_mb:.2f} MB)")
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_file = os.path.join(temp_dir, f"in.{meta['ext']}")
-        output_file = os.path.join(temp_dir, f"vid_{meta['id']}.mp4")
-        thumb_path = os.path.join(temp_dir, "thumb.jpg")
-        
-        # 1. Download Video (3 Retries)
-        dl_ok = False
-        for _ in range(3):
-            try:
-                async with session.get(meta["url"], headers=HEADERS) as resp:
-                    if resp.status == 200:
-                        with open(input_file, 'wb') as f:
-                            while True:
-                                chunk = await resp.content.read(65536)
-                                if not chunk: break
-                                f.write(chunk)
-                        dl_ok = True; break
-            except: await asyncio.sleep(1)
-        
-        if not dl_ok: return False
-
-        # 2. Download Thumb
-        has_thumb = False
-        if meta["preview_url"] and meta["ext"] != "gif":
-            try:
-                async with session.get(meta["preview_url"], headers=HEADERS) as r:
-                    if r.status==200:
-                        with open(thumb_path, 'wb') as f: f.write(await r.read())
-                        has_thumb = True
+    async def _init_schema(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS posted_videos (
+                    id SERIAL PRIMARY KEY,
+                    e621_id INT UNIQUE NOT NULL,
+                    md5_hash TEXT,
+                    posted_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_e621_id ON posted_videos(e621_id);
+                CREATE INDEX IF NOT EXISTS idx_md5 ON posted_videos(md5_hash);
+            """)
+            # Миграция
+            try: await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
             except: pass
 
-        final_path = input_file
+    async def check_health(self):
+        """Keepalive для базы."""
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+        except:
+            logger.warning("🔌 DB Reconnecting...")
+            try: await self.pool.close()
+            except: pass
+            self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=2)
+
+    async def filter_posts(self, posts):
+        if not posts: return []
         
-        # 3. Convert WebM
-        if meta["ext"] == "webm":
-            logger.info("⚙️ Converting WebM -> MP4...")
-            if await convert_to_mp4(input_file, output_file):
-                if os.path.getsize(output_file)/1048576 < MAX_ORIGINAL_SIZE_MB:
-                    final_path = output_file
-                    logger.info("✅ Converted OK")
-                else: logger.warning("⚠️ Converted > 50MB, reverting")
+        ids = [p['id'] for p in posts]
+        md5s = [p['file']['md5'] for p in posts if p.get('file', {}).get('md5')]
 
-        # 4. Upload (3 Retries)
-        for attempt in range(1, 4):
-            try:
-                media = FSInputFile(final_path, filename=f"video_{meta['id']}.mp4" if final_path.endswith("mp4") else f"v.{meta['ext']}")
-                thumb = FSInputFile(thumb_path) if has_thumb else None
-                
-                kwargs = {
-                    "chat_id": CHANNEL_ID, "caption": meta["caption"], "parse_mode": ParseMode.HTML
-                }
+        async with self.pool.acquire() as conn:
+            # Проверка ID
+            rows_id = await conn.fetch("SELECT e621_id FROM posted_videos WHERE e621_id = ANY($1::int[])", ids)
+            existing_ids = {r['e621_id'] for r in rows_id}
+            
+            # Проверка MD5
+            existing_md5s = set()
+            if md5s:
+                rows_md5 = await conn.fetch("SELECT md5_hash FROM posted_videos WHERE md5_hash = ANY($1::text[])", md5s)
+                existing_md5s = {r['md5_hash'] for r in rows_md5}
 
-                if meta["ext"] == "gif":
-                    await bot.send_animation(animation=media, **kwargs)
-                else:
-                    await bot.send_video(
-                        video=media, supports_streaming=True,
-                        width=meta["width"], height=meta["height"], duration=meta["duration"],
-                        thumbnail=thumb, **kwargs
-                    )
-                
-                gc.collect()
+        filtered = []
+        for p in posts:
+            if p['id'] not in existing_ids and p.get('file', {}).get('md5') not in existing_md5s:
+                filtered.append(p)
+        return filtered
+
+    async def add_post(self, post_id, md5):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO posted_videos (e621_id, md5_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING", 
+                post_id, md5
+            )
+
+# ===========================
+# 🎬 CONVERTER CLASS (THE FIX)
+# ===========================
+
+class VideoConverter:
+    @staticmethod
+    async def process(input_path, output_path):
+        """
+        Экстремальная оптимизация для 0.1 CPU.
+        """
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # 1. nice -n 19: Минимальный приоритет процесса (не мешает веб-серверу)
+        # 2. scale='min(540,iw)':-2 : Уменьшаем до 540p (мобильное качество)
+        # 3. fps=24 : Снижаем FPS до кинематографичных 24 (экономит 60% CPU по сравнению с 60fps)
+        # 4. crf 32 : Низкое качество кодирования (быстрее)
+        # 5. preset ultrafast : Самый быстрый пресет
+        cmd = [
+            "nice", "-n", "19", 
+            ffmpeg_exe, "-y", "-v", "error",
+            "-i", input_path,
+            "-vf", "scale='min(540,iw)':-2,fps=24", 
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "32",
+            "-pix_fmt", "yuv420p", # Для iPhone
+            "-c:a", "aac", "-b:a", "64k", "-ac", "2", # Легкое аудио
+            "-movflags", "+faststart",
+            output_path
+        ]
+        
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+            )
+            # Ждем 10 минут
+            await asyncio.wait_for(process.wait(), timeout=CONFIG["CONVERT_TIMEOUT"])
+            
+            if process.returncode == 0:
                 return True
-            except Exception as e:
-                logger.warning(f"⚠️ Upload retry {attempt}: {e}")
-                await asyncio.sleep(2)
+            else:
+                _, stderr = await process.communicate()
+                logger.error(f"FFmpeg Error: {stderr.decode()}")
+                return False
+        except asyncio.TimeoutError:
+            logger.error("⏱️ FFmpeg Timeout! Killing process.")
+            try: process.kill()
+            except: pass
+            return False
+        except Exception as e:
+            logger.error(f"Converter Exception: {e}")
+            return False
+
+# ===========================
+# 🌐 E621 CLIENT CLASS
+# ===========================
+
+class E621Client:
+    def __init__(self, session):
+        self.session = session
+        self.headers = {"User-Agent": CONFIG["USER_AGENT"]}
+
+    def _get_tags(self):
+        tags = BASE_TAGS
+        roll = random.random()
+        if roll < 0.15: tags += " date:<6months"; mode = "Fresh"
+        elif roll < 0.35: tags += " date:<1year"; mode = "Modern"
+        else: mode = "Legacy"
+        logger.info(f"🎲 {mode} | Query: {tags}")
+        return tags
+
+    async def fetch_posts(self):
+        try:
+            params = {"tags": f"{self._get_tags()} score:>={CONFIG['MIN_SCORE']}", "limit": 50}
+            async with self.session.get("https://e621.net/posts.json", params=params, headers=self.headers) as resp:
+                if resp.status != 200: return []
+                data = await resp.json(loads=ujson.loads)
+                return data.get("posts", [])
+        except: return []
+
+    async def get_artist_links(self, name):
+        if name in ARTIST_CACHE: return ARTIST_CACHE[name]
+        if name.lower() in IGNORED_ARTISTS: return []
         
-        return False
+        try:
+            params = {"search[name]": name, "limit": 1}
+            async with self.session.get("https://e621.net/artists.json", params=params, headers=self.headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json(loads=ujson.loads)
+                    if data:
+                        urls = data[0].get("urls", [])
+                        links = []
+                        seen = set()
+                        for u in urls:
+                            url = u.get("url", "")
+                            if url and url not in seen:
+                                links.append((get_site_name(url), url))
+                                seen.add(url)
+                                if len(links) >= 3: break
+                        ARTIST_CACHE[name] = links
+                        return links
+        except: pass
+        ARTIST_CACHE[name] = []
+        return []
 
+    async def parse_post(self, post):
+        f = post.get("file")
+        if not f or not f.get("url"): return None
+        ext = f["ext"]
+        if ext not in {"webm", "mp4", "gif"}: return None
+        
+        # Blacklist check
+        tags_flat = set(t for cat in post["tags"].values() for t in cat)
+        blacklist = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
+        if not tags_flat.isdisjoint(blacklist): return None
 
-async def processing_cycle(bot, session, pool):
+        # Size check
+        size_mb = f["size"] / 1_048_576
+        target_url = f["url"]
+        is_compressed = False
+        
+        # Если большой оригинал, ищем сэмпл
+        if size_mb > CONFIG["MAX_TG_MB"]:
+            sample = post.get("sample")
+            if sample and sample.get("has") and sample.get("url"):
+                target_url = sample["url"]
+                is_compressed = True
+            elif size_mb > CONFIG["MAX_DOWNLOAD_MB"]:
+                return None # Даже сжимать слишком тяжело
+
+        # Metadata
+        preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
+        
+        # Artists & Buttons
+        artists = [a for a in post["tags"]["artist"] if a.lower() not in IGNORED_ARTISTS][:3]
+        keyboard = []
+        keyboard.append([InlineKeyboardButton(text="🔗 e621 Source", url=f"https://e621.net/posts/{post['id']}")])
+        
+        artist_texts = []
+        for name in artists:
+            safe_name = html.escape(name.replace("_", " ").title())
+            links = await self.get_artist_links(name)
+            
+            row = [InlineKeyboardButton(text=f"🎨 {safe_name}", url=f"https://e621.net/posts?tags={name}")]
+            for site_name, site_url in links:
+                row.append(InlineKeyboardButton(text=site_name, url=site_url))
+            keyboard.append(row)
+            artist_texts.append(f'<a href="https://e621.net/posts?tags={name}">{safe_name}</a>')
+
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        artist_str = ", ".join(artist_texts) if artist_texts else "Unknown"
+        qual_tag = " <i>(Compressed)</i>" if is_compressed else ""
+        caption = f"<b>Artist:</b> {artist_str}{qual_tag}"
+
+        return {
+            "id": post["id"], "md5": f.get("md5"), "url": target_url, "ext": ext,
+            "caption": caption, "markup": markup, "is_compressed": is_compressed,
+            "width": f.get("width"), "height": f.get("height"), 
+            "duration": int(float(post.get("duration") or 0)),
+            "preview_url": preview_url, "has_spoiler": post["rating"] == "e"
+        }
+
+# ===========================
+# 🤖 BOT WORKER
+# ===========================
+
+async def processing_cycle(bot, e621, db):
     logger.info("--- 🔄 Cycle Start ---")
-    pool = await check_db_health(pool)
-    posts = await fetch_posts(session)
-    new_posts = await filter_new_posts(pool, posts)
+    await db.check_health()
     
-    if not new_posts: logger.info("💤 No new content"); return
+    posts = await e621.fetch_posts()
+    new_posts = await db.filter_posts(posts)
+    
+    if not new_posts:
+        logger.info("💤 No new content.")
+        return
 
     sent = 0
-    for post in new_posts:
-        if sent >= VIDEOS_PER_BATCH: break
-        meta = await parse_post_async(session, post)
-        if not meta: continue
-        
-        if await send_media(bot, session, meta):
-            await mark_as_posted(pool, meta["id"], meta["md5"])
-            sent += 1
+    # Создаем временную папку для этого цикла
+    with tempfile.TemporaryDirectory(prefix="bot_temp_") as temp_dir:
+        for post in new_posts:
+            if sent >= CONFIG["VIDEOS_PER_BATCH"]: break
+            
+            meta = await e621.parse_post(post)
+            if not meta: continue
+
+            # --- DOWNLOADING & PROCESSING ---
+            logger.info(f"⬇️ Processing {meta['id']}...")
+            
+            input_file = os.path.join(temp_dir, f"in_{meta['id']}.{meta['ext']}")
+            thumb_file = os.path.join(temp_dir, f"thumb_{meta['id']}.jpg")
+            final_file = input_file
+            
+            # 1. Скачивание видео
+            dl_success = False
+            for _ in range(3):
+                try:
+                    async with e621.session.get(meta["url"], timeout=300) as resp:
+                        if resp.status == 200:
+                            with open(input_file, 'wb') as f:
+                                while True:
+                                    chunk = await resp.content.read(65536)
+                                    if not chunk: break
+                                    f.write(chunk)
+                            dl_success = True; break
+                except: await asyncio.sleep(1)
+            
+            if not dl_success: continue
+
+            # 2. Скачивание превью
+            has_thumb = False
+            if meta["preview_url"] and meta["ext"] != "gif":
+                try:
+                    async with e621.session.get(meta["preview_url"], timeout=30) as r:
+                        if r.status == 200:
+                            with open(thumb_file, 'wb') as f: f.write(await r.read())
+                            has_thumb = True
+                except: pass
+
+            # 3. Конвертация (WebM или Heavy MP4)
+            file_size = os.path.getsize(input_file) / 1_048_576
+            needs_convert = (meta["ext"] == "webm") or (file_size > CONFIG["MAX_TG_MB"] and meta["ext"] == "mp4")
+            
+            if needs_convert:
+                logger.info(f"⚙️ Converting ({meta['ext']} -> mp4)...")
+                output_mp4 = os.path.join(temp_dir, f"out_{meta['id']}.mp4")
+                
+                if await VideoConverter.process(input_file, output_mp4):
+                    new_size = os.path.getsize(output_mp4) / 1_048_576
+                    if new_size < CONFIG["MAX_TG_MB"]:
+                        final_file = output_mp4
+                        logger.info(f"✅ Success! {file_size:.1f}MB -> {new_size:.1f}MB")
+                    else:
+                        logger.warning("⚠️ Compressed result too big.")
+                else:
+                    logger.warning("⚠️ Conversion failed/timed out.")
+                    # Если WebM не сконвертировался, но он маленький - пробуем слать как есть
+                    if meta["ext"] == "webm" and file_size < CONFIG["MAX_TG_MB"]:
+                        pass 
+                    else:
+                        continue # Не можем отправить
+
+            # 4. Отправка
+            for attempt in range(1, 4):
+                try:
+                    is_mp4 = final_file.endswith(".mp4")
+                    video_input = FSInputFile(final_file, filename=f"video_{meta['id']}.mp4" if is_mp4 else f"v.{meta['ext']}")
+                    thumb_input = FSInputFile(thumb_file) if has_thumb else None
+                    
+                    common = {
+                        "chat_id": CONFIG["CHANNEL_ID"],
+                        "caption": meta["caption"],
+                        "parse_mode": ParseMode.HTML,
+                        "reply_markup": meta["markup"]
+                    }
+
+                    if meta["ext"] == "gif":
+                        await bot.send_animation(animation=video_input, has_spoiler=meta["has_spoiler"], **common)
+                    else:
+                        await bot.send_video(
+                            video=video_input, thumbnail=thumb_input,
+                            width=meta["width"], height=meta["height"], duration=meta["duration"],
+                            supports_streaming=True, has_spoiler=meta["has_spoiler"], **common
+                        )
+                    
+                    await db.add_post(meta["id"], meta["md5"])
+                    sent += 1
+                    logger.info("✅ Sent.")
+                    break
+                except Exception as e:
+                    logger.error(f"Upload fail {attempt}: {e}")
+                    await asyncio.sleep(2)
+            
+            # Чистка RAM после каждого файла
+            gc.collect()
             await asyncio.sleep(5)
-    
-    logger.info(f"--- ✅ Cycle End. Sent: {sent} ---")
 
+    logger.info(f"--- Cycle End. Sent: {sent} ---")
 
-# ---------------- [ MAIN ] ---------------- #
+# ===========================
+# 🚀 MAIN ENTRY POINT
+# ===========================
 
-async def health(r): return web.Response(text="Alive")
-
-async def scheduler(bot, session, pool):
-    while True:
-        try: await processing_cycle(bot, session, pool)
-        except Exception as e:
-            logger.critical(f"🔥 Crash: {e}")
-            await send_alert(bot, f"Critical Error:\n{e}")
-        logger.info(f"⏳ Sleeping {SLEEP_INTERVAL}s...")
-        await asyncio.sleep(SLEEP_INTERVAL)
+async def health_check(r): return web.Response(text="Alive")
 
 async def main():
-    clean_temp_garbage()
-    pool = await asyncpg.create_pool(dsn=DB_DSN, min_size=1, max_size=2)
-    await init_db(pool)
+    # Настройка логгера
+    logger.remove()
+    logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
     
-    app = web.Application(); app.add_routes([web.get('/', health)])
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT",8080))).start()
+    clean_temp_dir()
     
-    # (v11.0) Network Timeout settings
-    async with ClientSession(connector=TCPConnector(limit=10, ssl=False), 
-                             json_serialize=ujson.dumps, headers=HEADERS,
-                             timeout=NETWORK_TIMEOUT) as session:
-        bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-        if ADMIN_ID: asyncio.create_task(send_alert(bot, "🟢 Bot started."))
-        await scheduler(bot, session, pool)
+    # Инициализация
+    db = Database(CONFIG["DB_DSN"])
+    await db.connect()
+    
+    # Web Server
+    app = web.Application()
+    app.add_routes([web.get('/', health_check)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080))).start()
+    
+    # Bot Session
+    async with ClientSession(
+        connector=TCPConnector(limit=10, ssl=False),
+        json_serialize=ujson.dumps,
+        timeout=ClientTimeout(total=600, connect=10)
+    ) as session:
+        
+        bot = Bot(token=CONFIG["BOT_TOKEN"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        e621 = E621Client(session)
+        
+        if CONFIG["ADMIN_ID"]:
+            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v13.0 Clean Rewrite)")
+            except: pass
+
+        while True:
+            try:
+                await processing_cycle(bot, e621, db)
+            except Exception as e:
+                logger.critical(f"🔥 Critical: {e}")
+                if CONFIG["ADMIN_ID"]:
+                    try: await bot.send_message(CONFIG["ADMIN_ID"], f"⚠️ Crash: {e}")
+                    except: pass
+            
+            logger.info(f"⏳ Sleeping {CONFIG['SLEEP_INTERVAL']}s...")
+            await asyncio.sleep(CONFIG["SLEEP_INTERVAL"])
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except: pass
+    except (KeyboardInterrupt, SystemExit): pass
