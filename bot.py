@@ -276,15 +276,18 @@ async def health_check(request):
     return web.Response(text="Alive")
 
 async def scheduler(bot, session, pool):
-    """Основной цикл: работа -> сон 1 час."""
+    """Бесконечный цикл: работа -> сон."""
+    # Читаем интервал из переменных окружения. По умолчанию 3600 (час).
+    sleep_seconds = int(os.getenv("SLEEP_INTERVAL", 3600))
+    
     while True:
         try:
             await process_and_send(bot, session, pool)
         except Exception as e:
             logger.critical(f"Scheduler error: {e}")
         
-        logger.info("Sleeping for 60 minutes...")
-        await asyncio.sleep(3600)
+        logger.info(f"Sleeping for {sleep_seconds} seconds...")
+        await asyncio.sleep(sleep_seconds)
 
 async def start_web_server():
     """Запуск веб-сервера для Health Check."""
