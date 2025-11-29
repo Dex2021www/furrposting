@@ -16,7 +16,7 @@ import ujson
 import asyncpg
 from aiohttp import ClientSession, TCPConnector, ClientTimeout, web
 from aiogram import Bot
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import FSInputFile
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from loguru import logger
@@ -31,15 +31,13 @@ CONFIG = {
     "CHANNEL_ID": os.getenv("CHANNEL_ID"),
     "ADMIN_ID": os.getenv("ADMIN_ID"),
     "DB_DSN": os.getenv("DB_DSN"),
-    "USER_AGENT": os.getenv("E621_USER_AGENT", "TgBot/13.1 (Fixed DB)"),
+    # Исправленный User-Agent с твоим ником
+    "USER_AGENT": os.getenv("E621_USER_AGENT", "TelegramVideoBot/14.0 (by Dexz)"),
     "SLEEP_INTERVAL": int(os.getenv("SLEEP_INTERVAL", 3600)),
     "VIDEOS_PER_BATCH": 2,
     "MIN_SCORE": 200,
-    # Максимальный размер для скачивания и попытки сжатия
     "MAX_DOWNLOAD_MB": 80.0, 
-    # Максимальный размер итогового файла для Telegram
     "MAX_TG_MB": 49.9,
-    # Таймаут конвертации (10 минут)
     "CONVERT_TIMEOUT": 600
 }
 
@@ -67,13 +65,10 @@ def clean_temp_dir():
         tmp = tempfile.gettempdir()
         count = 0
         for p in glob.glob(os.path.join(tmp, "bot_temp_*")):
-            try:
-                os.remove(p)
-                count += 1
+            try: os.remove(p); count += 1
             except: pass
         if count: logger.info(f"🧹 Cleaned {count} old temp files.")
-    except Exception as e:
-        logger.warning(f"Cleanup error: {e}")
+    except Exception as e: logger.warning(f"Cleanup error: {e}")
 
 def get_site_name(url):
     try:
@@ -89,7 +84,7 @@ def get_site_name(url):
     except: return "Link"
 
 # ===========================
-# 🗄️ DATABASE CLASS (FIXED)
+# 🗄️ DATABASE CLASS
 # ===========================
 
 class Database:
@@ -103,7 +98,6 @@ class Database:
 
     async def _init_schema(self):
         async with self.pool.acquire() as conn:
-            # 1. Создаем таблицу (базовая структура)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS posted_videos (
                     id SERIAL PRIMARY KEY,
@@ -111,15 +105,8 @@ class Database:
                     posted_at TIMESTAMP DEFAULT NOW()
                 );
             """)
-
-            # 2. МИГРАЦИЯ: Добавляем колонку md5_hash ОТДЕЛЬНО
-            # Это гарантирует, что колонка появится до создания индекса
-            try:
-                await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
-            except Exception as e:
-                logger.warning(f"DB Migration info: {e}")
-
-            # 3. Создаем индексы (теперь это безопасно)
+            try: await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
+            except: pass
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_e621_id ON posted_videos(e621_id);
                 CREATE INDEX IF NOT EXISTS idx_md5 ON posted_videos(md5_hash);
@@ -127,8 +114,7 @@ class Database:
 
     async def check_health(self):
         try:
-            async with self.pool.acquire() as conn:
-                await conn.execute("SELECT 1")
+            async with self.pool.acquire() as conn: await conn.execute("SELECT 1")
         except:
             logger.warning("🔌 DB Reconnecting...")
             try: await self.pool.close()
@@ -137,7 +123,6 @@ class Database:
 
     async def filter_posts(self, posts):
         if not posts: return []
-        
         ids = [p['id'] for p in posts]
         md5s = [p['file']['md5'] for p in posts if p.get('file', {}).get('md5')]
 
@@ -150,18 +135,11 @@ class Database:
                 rows_md5 = await conn.fetch("SELECT md5_hash FROM posted_videos WHERE md5_hash = ANY($1::text[])", md5s)
                 existing_md5s = {r['md5_hash'] for r in rows_md5}
 
-        filtered = []
-        for p in posts:
-            if p['id'] not in existing_ids and p.get('file', {}).get('md5') not in existing_md5s:
-                filtered.append(p)
-        return filtered
+        return [p for p in posts if p['id'] not in existing_ids and p.get('file', {}).get('md5') not in existing_md5s]
 
     async def add_post(self, post_id, md5):
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO posted_videos (e621_id, md5_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING", 
-                post_id, md5
-            )
+            await conn.execute("INSERT INTO posted_videos (e621_id, md5_hash) VALUES ($1, $2) ON CONFLICT DO NOTHING", post_id, md5)
 
 # ===========================
 # 🎬 CONVERTER CLASS
@@ -172,15 +150,15 @@ class VideoConverter:
     async def process(input_path, output_path):
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
-        # Настройки для экстремально слабого CPU
+        # Настройки баланса (720p, 30fps, crf 26)
         cmd = [
             "nice", "-n", "19", 
             ffmpeg_exe, "-y", "-v", "error",
             "-i", input_path,
-            "-vf", "scale='min(540,iw)':-2,fps=24", 
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "32",
+            "-vf", "scale='min(720,iw)':-2,fps=30", 
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "26",
             "-pix_fmt", "yuv420p", 
-            "-c:a", "aac", "-b:a", "64k", "-ac", "2",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-movflags", "+faststart",
             output_path
         ]
@@ -191,14 +169,13 @@ class VideoConverter:
             )
             await asyncio.wait_for(process.wait(), timeout=CONFIG["CONVERT_TIMEOUT"])
             
-            if process.returncode == 0:
-                return True
+            if process.returncode == 0: return True
             else:
                 _, stderr = await process.communicate()
                 logger.error(f"FFmpeg Error: {stderr.decode()}")
                 return False
         except asyncio.TimeoutError:
-            logger.error("⏱️ FFmpeg Timeout! Killing process.")
+            logger.error("⏱️ FFmpeg Timeout!")
             try: process.kill()
             except: pass
             return False
@@ -236,7 +213,6 @@ class E621Client:
     async def get_artist_links(self, name):
         if name in ARTIST_CACHE: return ARTIST_CACHE[name]
         if name.lower() in IGNORED_ARTISTS: return []
-        
         try:
             params = {"search[name]": name, "limit": 1}
             async with self.session.get("https://e621.net/artists.json", params=params, headers=self.headers) as resp:
@@ -277,37 +253,50 @@ class E621Client:
             if sample and sample.get("has") and sample.get("url"):
                 target_url = sample["url"]
                 is_compressed = True
-            elif size_mb > CONFIG["MAX_DOWNLOAD_MB"]:
-                return None 
+            elif size_mb > CONFIG["MAX_DOWNLOAD_MB"]: return None 
 
         preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
         artists = [a for a in post["tags"]["artist"] if a.lower() not in IGNORED_ARTISTS][:3]
         
-        keyboard = []
-        keyboard.append([InlineKeyboardButton(text="🔗 e621 Source", url=f"https://e621.net/posts/{post['id']}")])
-        
+        # Генерация текста (без кнопок)
         artist_texts = []
         for name in artists:
             safe_name = html.escape(name.replace("_", " ").title())
             links = await self.get_artist_links(name)
             
-            row = [InlineKeyboardButton(text=f"🎨 {safe_name}", url=f"https://e621.net/posts?tags={name}")]
-            for site_name, site_url in links:
-                row.append(InlineKeyboardButton(text=site_name, url=site_url))
-            keyboard.append(row)
-            artist_texts.append(f'<a href="https://e621.net/posts?tags={name}">{safe_name}</a>')
+            # Ссылка на e621 + (Ссылки в скобках)
+            e621_link = f'<a href="https://e621.net/posts?tags={name}">{safe_name}</a>'
+            
+            if links:
+                # Формируем строку ссылок: Twitter | Patreon ...
+                external_links_str = " | ".join([f'<a href="{url}">{site}</a>' for site, url in links])
+                line = f"{e621_link} ({external_links_str})"
+            else:
+                line = e621_link
+            
+            artist_texts.append(line)
 
-        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
-        artist_str = ", ".join(artist_texts) if artist_texts else "Unknown"
+        # Собираем красивый блок авторов
+        if not artist_texts:
+            artist_block = "<b>Artist:</b> Unknown"
+        elif len(artist_texts) == 1:
+            artist_block = f"<b>Artist:</b> {artist_texts[0]}"
+        else:
+            # Если несколько авторов - каждый с новой строки для читаемости
+            artist_block = "<b>Artists:</b>\n" + "\n".join(artist_texts)
+
+        source_link = f"https://e621.net/posts/{post['id']}"
         qual_tag = " <i>(Compressed)</i>" if is_compressed else ""
-        caption = f"<b>Artist:</b> {artist_str}{qual_tag}"
+        
+        # Итоговое описание: Автор, Источник, Пометка сжатия
+        caption = f"{artist_block}\n<b>Source:</b> <a href='{source_link}'>e621</a>{qual_tag}"
 
         return {
             "id": post["id"], "md5": f.get("md5"), "url": target_url, "ext": ext,
-            "caption": caption, "markup": markup, "is_compressed": is_compressed,
+            "caption": caption, "is_compressed": is_compressed,
             "width": f.get("width"), "height": f.get("height"), 
             "duration": int(float(post.get("duration") or 0)),
-            "preview_url": preview_url, "has_spoiler": post["rating"] == "e"
+            "preview_url": preview_url
         }
 
 # ===========================
@@ -321,15 +310,12 @@ async def processing_cycle(bot, e621, db):
     posts = await e621.fetch_posts()
     new_posts = await db.filter_posts(posts)
     
-    if not new_posts:
-        logger.info("💤 No new content.")
-        return
+    if not new_posts: logger.info("💤 No new content."); return
 
     sent = 0
     with tempfile.TemporaryDirectory(prefix="bot_temp_") as temp_dir:
         for post in new_posts:
             if sent >= CONFIG["VIDEOS_PER_BATCH"]: break
-            
             meta = await e621.parse_post(post)
             if not meta: continue
 
@@ -339,7 +325,7 @@ async def processing_cycle(bot, e621, db):
             thumb_file = os.path.join(temp_dir, f"thumb_{meta['id']}.jpg")
             final_file = input_file
             
-            # 1. Скачивание видео
+            # Download
             dl_success = False
             for _ in range(3):
                 try:
@@ -355,7 +341,7 @@ async def processing_cycle(bot, e621, db):
             
             if not dl_success: continue
 
-            # 2. Скачивание превью
+            # Thumb
             has_thumb = False
             if meta["preview_url"] and meta["ext"] != "gif":
                 try:
@@ -365,7 +351,7 @@ async def processing_cycle(bot, e621, db):
                             has_thumb = True
                 except: pass
 
-            # 3. Конвертация
+            # Convert
             file_size = os.path.getsize(input_file) / 1_048_576
             needs_convert = (meta["ext"] == "webm") or (file_size > CONFIG["MAX_TG_MB"] and meta["ext"] == "mp4")
             
@@ -378,15 +364,13 @@ async def processing_cycle(bot, e621, db):
                     if new_size < CONFIG["MAX_TG_MB"]:
                         final_file = output_mp4
                         logger.info(f"✅ Success! {file_size:.1f}MB -> {new_size:.1f}MB")
-                    else:
-                        logger.warning("⚠️ Compressed result too big.")
+                    else: logger.warning("⚠️ Compressed result too big.")
                 else:
                     logger.warning("⚠️ Conversion failed.")
-                    if meta["ext"] == "webm" and file_size < CONFIG["MAX_TG_MB"]:
-                        pass 
+                    if meta["ext"] == "webm" and file_size < CONFIG["MAX_TG_MB"]: pass 
                     else: continue
 
-            # 4. Отправка
+            # Upload
             for attempt in range(1, 4):
                 try:
                     is_mp4 = final_file.endswith(".mp4")
@@ -396,17 +380,16 @@ async def processing_cycle(bot, e621, db):
                     common = {
                         "chat_id": CONFIG["CHANNEL_ID"],
                         "caption": meta["caption"],
-                        "parse_mode": ParseMode.HTML,
-                        "reply_markup": meta["markup"]
+                        "parse_mode": ParseMode.HTML
                     }
 
                     if meta["ext"] == "gif":
-                        await bot.send_animation(animation=video_input, has_spoiler=meta["has_spoiler"], **common)
+                        await bot.send_animation(animation=video_input, **common)
                     else:
                         await bot.send_video(
                             video=video_input, thumbnail=thumb_input,
                             width=meta["width"], height=meta["height"], duration=meta["duration"],
-                            supports_streaming=True, has_spoiler=meta["has_spoiler"], **common
+                            supports_streaming=True, **common
                         )
                     
                     await db.add_post(meta["id"], meta["md5"])
@@ -452,12 +435,11 @@ async def main():
         e621 = E621Client(session)
         
         if CONFIG["ADMIN_ID"]:
-            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v13.1 Fixed DB)")
+            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v14.0 Clean & Simple)")
             except: pass
 
         while True:
-            try:
-                await processing_cycle(bot, e621, db)
+            try: await processing_cycle(bot, e621, db)
             except Exception as e:
                 logger.critical(f"🔥 Critical: {e}")
                 if CONFIG["ADMIN_ID"]:
