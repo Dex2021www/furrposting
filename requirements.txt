@@ -6,3 +6,4 @@ uvloop
 asyncpg
 ujson
 loguru
+cachetools
