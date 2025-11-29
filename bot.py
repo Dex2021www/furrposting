@@ -31,7 +31,7 @@ CONFIG = {
     "CHANNEL_ID": os.getenv("CHANNEL_ID"),
     "ADMIN_ID": os.getenv("ADMIN_ID"),
     "DB_DSN": os.getenv("DB_DSN"),
-    "USER_AGENT": os.getenv("E621_USER_AGENT", "TgBot/13.0 (Optimized for 0.1CPU)"),
+    "USER_AGENT": os.getenv("E621_USER_AGENT", "TgBot/13.1 (Fixed DB)"),
     "SLEEP_INTERVAL": int(os.getenv("SLEEP_INTERVAL", 3600)),
     "VIDEOS_PER_BATCH": 2,
     "MIN_SCORE": 200,
@@ -43,24 +43,19 @@ CONFIG = {
     "CONVERT_TIMEOUT": 600
 }
 
-# Теги: Исключаем безопасное, людей, картинки, флеш
 BASE_TAGS = "-rating:safe order:random -human -type:png -type:jpg -type:swf"
 
-# Игнорируемые "художники"
 IGNORED_ARTISTS = {
     "conditional_dnp", "sound_warning", "unknown", "anonymous",
     "ai_generated", "ai_assisted", "stable_diffusion", "img2img", "midjourney"
 }
 
-# Кэш для ссылок авторов
 ARTIST_CACHE = TTLCache(maxsize=2000, ttl=86400)
 
-# Проверка переменных
 if not all([CONFIG["BOT_TOKEN"], CONFIG["CHANNEL_ID"], CONFIG["DB_DSN"]]):
     logger.critical("❌ Missing Environment Variables!")
     sys.exit(1)
 
-# Установка быстрого лупа
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 # ===========================
@@ -68,7 +63,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # ===========================
 
 def clean_temp_dir():
-    """Чистит временные файлы при старте."""
     try:
         tmp = tempfile.gettempdir()
         count = 0
@@ -82,7 +76,6 @@ def clean_temp_dir():
         logger.warning(f"Cleanup error: {e}")
 
 def get_site_name(url):
-    """Превращает ссылку в красивое название сайта."""
     try:
         domain = urlparse(url).netloc.replace("www.", "").split('.')[0].lower()
         mapping = {
@@ -96,7 +89,7 @@ def get_site_name(url):
     except: return "Link"
 
 # ===========================
-# 🗄️ DATABASE CLASS
+# 🗄️ DATABASE CLASS (FIXED)
 # ===========================
 
 class Database:
@@ -110,22 +103,29 @@ class Database:
 
     async def _init_schema(self):
         async with self.pool.acquire() as conn:
+            # 1. Создаем таблицу (базовая структура)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS posted_videos (
                     id SERIAL PRIMARY KEY,
                     e621_id INT UNIQUE NOT NULL,
-                    md5_hash TEXT,
                     posted_at TIMESTAMP DEFAULT NOW()
                 );
+            """)
+
+            # 2. МИГРАЦИЯ: Добавляем колонку md5_hash ОТДЕЛЬНО
+            # Это гарантирует, что колонка появится до создания индекса
+            try:
+                await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
+            except Exception as e:
+                logger.warning(f"DB Migration info: {e}")
+
+            # 3. Создаем индексы (теперь это безопасно)
+            await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_e621_id ON posted_videos(e621_id);
                 CREATE INDEX IF NOT EXISTS idx_md5 ON posted_videos(md5_hash);
             """)
-            # Миграция
-            try: await conn.execute("ALTER TABLE posted_videos ADD COLUMN IF NOT EXISTS md5_hash TEXT;")
-            except: pass
 
     async def check_health(self):
-        """Keepalive для базы."""
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute("SELECT 1")
@@ -142,11 +142,9 @@ class Database:
         md5s = [p['file']['md5'] for p in posts if p.get('file', {}).get('md5')]
 
         async with self.pool.acquire() as conn:
-            # Проверка ID
             rows_id = await conn.fetch("SELECT e621_id FROM posted_videos WHERE e621_id = ANY($1::int[])", ids)
             existing_ids = {r['e621_id'] for r in rows_id}
             
-            # Проверка MD5
             existing_md5s = set()
             if md5s:
                 rows_md5 = await conn.fetch("SELECT md5_hash FROM posted_videos WHERE md5_hash = ANY($1::text[])", md5s)
@@ -166,30 +164,23 @@ class Database:
             )
 
 # ===========================
-# 🎬 CONVERTER CLASS (THE FIX)
+# 🎬 CONVERTER CLASS
 # ===========================
 
 class VideoConverter:
     @staticmethod
     async def process(input_path, output_path):
-        """
-        Экстремальная оптимизация для 0.1 CPU.
-        """
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         
-        # 1. nice -n 19: Минимальный приоритет процесса (не мешает веб-серверу)
-        # 2. scale='min(540,iw)':-2 : Уменьшаем до 540p (мобильное качество)
-        # 3. fps=24 : Снижаем FPS до кинематографичных 24 (экономит 60% CPU по сравнению с 60fps)
-        # 4. crf 32 : Низкое качество кодирования (быстрее)
-        # 5. preset ultrafast : Самый быстрый пресет
+        # Настройки для экстремально слабого CPU
         cmd = [
             "nice", "-n", "19", 
             ffmpeg_exe, "-y", "-v", "error",
             "-i", input_path,
             "-vf", "scale='min(540,iw)':-2,fps=24", 
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "32",
-            "-pix_fmt", "yuv420p", # Для iPhone
-            "-c:a", "aac", "-b:a", "64k", "-ac", "2", # Легкое аудио
+            "-pix_fmt", "yuv420p", 
+            "-c:a", "aac", "-b:a", "64k", "-ac", "2",
             "-movflags", "+faststart",
             output_path
         ]
@@ -198,7 +189,6 @@ class VideoConverter:
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
             )
-            # Ждем 10 минут
             await asyncio.wait_for(process.wait(), timeout=CONFIG["CONVERT_TIMEOUT"])
             
             if process.returncode == 0:
@@ -274,30 +264,25 @@ class E621Client:
         ext = f["ext"]
         if ext not in {"webm", "mp4", "gif"}: return None
         
-        # Blacklist check
         tags_flat = set(t for cat in post["tags"].values() for t in cat)
         blacklist = {"scat", "guro", "bestiality", "cub", "gore", "watersports", "hyper"}
         if not tags_flat.isdisjoint(blacklist): return None
 
-        # Size check
         size_mb = f["size"] / 1_048_576
         target_url = f["url"]
         is_compressed = False
         
-        # Если большой оригинал, ищем сэмпл
         if size_mb > CONFIG["MAX_TG_MB"]:
             sample = post.get("sample")
             if sample and sample.get("has") and sample.get("url"):
                 target_url = sample["url"]
                 is_compressed = True
             elif size_mb > CONFIG["MAX_DOWNLOAD_MB"]:
-                return None # Даже сжимать слишком тяжело
+                return None 
 
-        # Metadata
         preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
-        
-        # Artists & Buttons
         artists = [a for a in post["tags"]["artist"] if a.lower() not in IGNORED_ARTISTS][:3]
+        
         keyboard = []
         keyboard.append([InlineKeyboardButton(text="🔗 e621 Source", url=f"https://e621.net/posts/{post['id']}")])
         
@@ -341,7 +326,6 @@ async def processing_cycle(bot, e621, db):
         return
 
     sent = 0
-    # Создаем временную папку для этого цикла
     with tempfile.TemporaryDirectory(prefix="bot_temp_") as temp_dir:
         for post in new_posts:
             if sent >= CONFIG["VIDEOS_PER_BATCH"]: break
@@ -349,7 +333,6 @@ async def processing_cycle(bot, e621, db):
             meta = await e621.parse_post(post)
             if not meta: continue
 
-            # --- DOWNLOADING & PROCESSING ---
             logger.info(f"⬇️ Processing {meta['id']}...")
             
             input_file = os.path.join(temp_dir, f"in_{meta['id']}.{meta['ext']}")
@@ -382,7 +365,7 @@ async def processing_cycle(bot, e621, db):
                             has_thumb = True
                 except: pass
 
-            # 3. Конвертация (WebM или Heavy MP4)
+            # 3. Конвертация
             file_size = os.path.getsize(input_file) / 1_048_576
             needs_convert = (meta["ext"] == "webm") or (file_size > CONFIG["MAX_TG_MB"] and meta["ext"] == "mp4")
             
@@ -398,12 +381,10 @@ async def processing_cycle(bot, e621, db):
                     else:
                         logger.warning("⚠️ Compressed result too big.")
                 else:
-                    logger.warning("⚠️ Conversion failed/timed out.")
-                    # Если WebM не сконвертировался, но он маленький - пробуем слать как есть
+                    logger.warning("⚠️ Conversion failed.")
                     if meta["ext"] == "webm" and file_size < CONFIG["MAX_TG_MB"]:
                         pass 
-                    else:
-                        continue # Не можем отправить
+                    else: continue
 
             # 4. Отправка
             for attempt in range(1, 4):
@@ -436,37 +417,31 @@ async def processing_cycle(bot, e621, db):
                     logger.error(f"Upload fail {attempt}: {e}")
                     await asyncio.sleep(2)
             
-            # Чистка RAM после каждого файла
             gc.collect()
             await asyncio.sleep(5)
 
     logger.info(f"--- Cycle End. Sent: {sent} ---")
 
 # ===========================
-# 🚀 MAIN ENTRY POINT
+# 🚀 MAIN
 # ===========================
 
 async def health_check(r): return web.Response(text="Alive")
 
 async def main():
-    # Настройка логгера
     logger.remove()
     logger.add(sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{message}</level>")
-    
     clean_temp_dir()
     
-    # Инициализация
     db = Database(CONFIG["DB_DSN"])
     await db.connect()
     
-    # Web Server
     app = web.Application()
     app.add_routes([web.get('/', health_check)])
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 8080))).start()
     
-    # Bot Session
     async with ClientSession(
         connector=TCPConnector(limit=10, ssl=False),
         json_serialize=ujson.dumps,
@@ -477,7 +452,7 @@ async def main():
         e621 = E621Client(session)
         
         if CONFIG["ADMIN_ID"]:
-            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v13.0 Clean Rewrite)")
+            try: await bot.send_message(CONFIG["ADMIN_ID"], "🟢 Bot Started (v13.1 Fixed DB)")
             except: pass
 
         while True:
