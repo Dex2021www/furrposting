@@ -21,14 +21,11 @@ from cachetools import TTLCache
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 DB_DSN = os.getenv("DB_DSN")
-E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/6.0 (by Dexz)")
+E621_USER_AGENT = os.getenv("E621_USER_AGENT", "TelegramVideoBot/7.0 (by Dexz)")
 HEADERS = {"User-Agent": E621_USER_AGENT}
 
-# Теги
 BASE_TAGS = "-rating:safe order:random -human"
 MIN_SCORE = 130
-
-# Лимиты
 MAX_ORIGINAL_SIZE_MB = 49.9
 
 VIDEOS_PER_BATCH = 2
@@ -80,7 +77,7 @@ async def mark_as_posted(pool, e621_id):
         await conn.execute("INSERT INTO posted_videos (e621_id) VALUES ($1) ON CONFLICT DO NOTHING", e621_id)
 
 
-# ---------------- [ ПАРСИНГ И API ] ---------------- #
+# ---------------- [ ПАРСИНГ ] ---------------- #
 
 def get_query_tags():
     tags = f"{BASE_TAGS} -type:png -type:jpg -type:swf"
@@ -116,7 +113,6 @@ async def get_artist_links(session, artist_name):
 
     url = "https://e621.net/artists.json"
     params = {"search[name]": artist_name, "limit": 1}
-    
     try:
         async with session.get(url, params=params, headers=HEADERS, timeout=5) as resp:
             if resp.status == 200:
@@ -138,18 +134,14 @@ async def get_artist_links(session, artist_name):
                         name = "Link"
                         for key, val in sites.items():
                             if key in addr:
-                                name = val
-                                break
+                                name = val; break
                         links.append(f'<a href="{addr}">{name}</a>')
                     
-                    seen = set()
-                    unique_links = []
+                    seen = set(); unique_links = []
                     for l in links:
                         if l not in seen:
-                            unique_links.append(l)
-                            seen.add(l)
+                            unique_links.append(l); seen.add(l)
                             if len(unique_links) >= 3: break
-                    
                     ARTIST_CACHE[artist_name] = unique_links
                     return unique_links
     except Exception: pass 
@@ -162,18 +154,16 @@ async def parse_post_async(session, post):
     ext = f["ext"]
     if ext not in ALLOWED_EXTS: return None
     
-    # Блеклист
     ptags = post["tags"]
     all_tags = set(ptags["general"] + ptags["character"] + ptags["species"] + ptags["copyright"])
     if not all_tags.isdisjoint(BLACKLIST_SET): return None
 
-    # --- КАЧЕСТВО ---
+    # Качество
     original_size_mb = f["size"] / 1_048_576
     target_url = f["url"]
     target_size = f["size"]
     is_compressed = False
 
-    # Если оригинал больше лимита Telegram, ищем сэмпл
     if original_size_mb > MAX_ORIGINAL_SIZE_MB:
         sample = post.get("sample")
         if sample and sample.get("has") and sample.get("url"):
@@ -181,22 +171,22 @@ async def parse_post_async(session, post):
             target_size = 0 
             is_compressed = True
         else:
-            return None # Слишком большой и нет сэмпла
+            return None 
 
-    # --- МЕТАДАННЫЕ ВИДЕО (ВАЖНО ДЛЯ TELEGRAM) ---
-    # Мы явно достаем ширину, высоту и длительность.
-    # Это гарантирует, что Telegram отобразит файл как видео, а не документ.
+    # Метаданные
     width = f.get("width")
     height = f.get("height")
-    # Длительность иногда бывает null
     duration = post.get("duration") 
-    if duration: 
-        duration = int(float(duration))
+    if duration: duration = int(float(duration))
 
-    # --- АВТОРЫ ---
+    # --- ПРЕВЬЮ (THUMBNAIL) ---
+    # Берем sample url (средний размер) или preview url (маленький)
+    # Это нужно, чтобы Телеграм не показывал видео как файл
+    preview_url = post.get("sample", {}).get("url") or post.get("preview", {}).get("url")
+
+    # Авторы
     artists_names = [a for a in ptags["artist"] if a.lower() not in IGNORED_ARTISTS]
     artist_lines = []
-    
     for name in artists_names[:3]:
         e621_link = f'<a href="https://e621.net/posts?tags={name}">{name.replace("_", " ").title()}</a>'
         ext_links = await get_artist_links(session, name)
@@ -206,26 +196,18 @@ async def parse_post_async(session, post):
     if not artist_lines: artist_block = "<b>Artist:</b> Unknown"
     elif len(artist_lines) > 1: artist_block = f"<b>Artists:</b> \n          " + "\n          ".join(artist_lines)
     else: artist_block = f"<b>Artist:</b> {artist_lines[0]}"
-    
     if len(artists_names) > 3: artist_block += f" <i>(+{len(artists_names)-3} others)</i>"
 
-    # --- ИСТОЧНИК ---
     source_link = f"https://e621.net/posts/{post['id']}"
     source_block = f"<b>Source:</b> <a href='{source_link}'>e621</a>"
-
     quality_tag = " <i>(Compressed)</i>" if is_compressed else ""
     caption = f"{artist_block}\n{source_block}{quality_tag}"
     
     return {
-        "id": post["id"], 
-        "url": target_url, 
-        "size": target_size, 
-        "ext": ext, 
-        "caption": caption,
-        "is_compressed": is_compressed,
-        "width": width,
-        "height": height,
-        "duration": duration
+        "id": post["id"], "url": target_url, "size": target_size, "ext": ext, 
+        "caption": caption, "is_compressed": is_compressed,
+        "width": width, "height": height, "duration": duration,
+        "preview_url": preview_url # Ссылка на картинку
     }
 
 
@@ -235,36 +217,46 @@ async def send_media(bot, session, meta):
     size_mb = meta["size"] / 1_048_576
     filename = f"video_{meta['id']}.{meta['ext']}"
     
-    # Если размер неизвестен (сэмпл), узнаем его
+    # Узнаем размер, если это сэмпл
     if meta["is_compressed"] or size_mb == 0:
         try:
             async with session.head(meta["url"], headers=HEADERS) as resp:
                 if resp.status == 200:
-                    content_length = int(resp.headers.get("Content-Length", 0))
-                    if content_length > 0:
-                        size_mb = content_length / 1_048_576
-                        logger.info(f"📏 Sample size: {size_mb:.2f} MB")
-        except Exception:
-            size_mb = 25 # Fallback
+                    cl = int(resp.headers.get("Content-Length", 0))
+                    if cl > 0: size_mb = cl / 1_048_576
+        except Exception: size_mb = 25 
 
-    # ЕДИНАЯ ЛОГИКА: Всегда качаем в RAM, если влезает в лимит.
-    # Это решает проблему "Документ вместо видео" для мелких файлов по URL.
     if size_mb < MAX_ORIGINAL_SIZE_MB:
         logger.info(f"⬇️ RAM DL [{meta['ext']}]: {meta['id']} ({size_mb:.2f} MB)")
         
+        video_bytes = None
+        thumb_obj = None # Объект для обложки
+
         try:
+            # 1. Скачиваем ВИДЕО
             async with session.get(meta["url"], headers=HEADERS) as resp:
-                if resp.status != 200:
-                    logger.error(f"DL Fail: {resp.status}")
-                    return False
-                content = await resp.read()
+                if resp.status != 200: return False
+                video_bytes = await resp.read()
             
-            file_obj = BytesIO(content)
-            file_obj.name = filename
-            del content
+            video_io = BytesIO(video_bytes)
+            video_io.name = filename
+            del video_bytes
             
+            # 2. Скачиваем ОБЛОЖКУ (если есть)
+            # Это ключевой момент для отображения плеера!
+            if meta["preview_url"] and meta["ext"] != "gif":
+                try:
+                    async with session.get(meta["preview_url"], headers=HEADERS) as t_resp:
+                        if t_resp.status == 200:
+                            t_bytes = await t_resp.read()
+                            t_io = BytesIO(t_bytes)
+                            t_io.name = "thumb.jpg"
+                            thumb_obj = BufferedInputFile(t_io.getvalue(), filename="thumb.jpg")
+                except Exception as e:
+                    logger.warning(f"Thumb DL failed: {e}")
+
             logger.info(f"⬆️ RAM Upload...")
-            media = BufferedInputFile(file_obj.getvalue(), filename=file_obj.name)
+            media = BufferedInputFile(video_io.getvalue(), filename=video_io.name)
             
             kwargs = {
                 "chat_id": CHANNEL_ID,
@@ -273,29 +265,28 @@ async def send_media(bot, session, meta):
             }
 
             if meta["ext"] == "gif":
-                # Для GIF параметры width/height не так важны, но можно передать
                 await bot.send_animation(animation=media, **kwargs)
             else:
-                # ВАЖНО: Передаем метаданные видео!
                 await bot.send_video(
                     video=media, 
                     supports_streaming=True,
                     width=meta["width"],
                     height=meta["height"],
                     duration=meta["duration"],
+                    thumbnail=thumb_obj, # <--- ПЕРЕДАЕМ ОБЛОЖКУ
                     **kwargs
                 )
             
-            file_obj.close()
-            del file_obj
+            video_io.close()
+            del video_io
             del media
+            if thumb_obj: del thumb_obj
             gc.collect()
             return True
             
         except Exception as e:
             logger.error(f"❌ RAM Send Error {meta['id']}: {e}")
             return False
-            
     else:
         logger.warning(f"⚠️ Skip: File too big ({size_mb:.2f} MB)")
         return False
