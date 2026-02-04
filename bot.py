@@ -34,7 +34,7 @@ CONFIG = {
     "DB_DSN": os.getenv("DB_DSN"),
     "USER_AGENT": os.getenv("E621_USER_AGENT", "TelegramVideoBot/16.0 (ByDexz)"),
     "VIDEOS_PER_BATCH": 2,
-    "MIN_SCORE": 200,
+    "MIN_SCORE": 205,
     "MAX_DOWNLOAD_MB": 80.0, 
     "MAX_TG_MB": 49.9,
     "CONVERT_TIMEOUT": 600,
@@ -50,7 +50,7 @@ BLACKLIST_WORDS = {
     "urine", "feces", "vomit", "diaper", "rape", "non-consensual", 
     "nazi", "swastika", "ss_uniform", "third_reich", "fascist", 
     "hate_symbol", "racism", "antisemitism", "confederate_flag", 
-    "furry_raiders", "political", "hyper"
+    "furry_raiders", "political", "hyper", "feral", "vore", "inflation"
 }
 BLACKLIST_SET = set(BLACKLIST_WORDS)
 
